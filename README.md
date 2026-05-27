@@ -1,3 +1,5 @@
+WIP doesn't scale to largedatasets yet, working on it.
+
 # FM — Field Machine
 
 A new sequence architecture invented May 26, 2026. Not a transformer. Not an RNN. Not an SSM.
