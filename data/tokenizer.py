@@ -3,24 +3,23 @@ FM Tokenizer
 ============
 Converts raw MIDI files into structured DNA token fields.
 
-Vocab key: (pitch, snapped_duration)
-  - pitch         : full MIDI pitch 0-127
-  - snapped_duration: nearest musical duration from [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+Vocab key: (event_type, pitch_or_none, snapped_duration, beat_bin)
+  event_type      : 'note' or 'rest'
+  pitch           : MIDI pitch 0-127 (note tokens only, None for rest)
+  snapped_duration: nearest value from MUSICAL_DURS
+  beat_bin        : quantized beat position, 0-15 (16 bins per bar)
 
-Everything else — octave, pitch class, beat position, velocity, voice —
-is continuous DNA, not vocab identity. These are expressive details, not
-token types. Voice was mistakenly in the vocab key; it's already a DNA field.
+REST tokens carry only duration and beat_bin. Pitch/octave/pitch_class
+fields are zeroed.
 
-Result: ~529 token types instead of 17978. Decoder is 100x smaller.
-
-Each token carries 7 DNA fields for the model:
-  pitch_class  : int   0-11
-  octave       : float 0-1
+DNA fields (unchanged dimensionality — 23 dims):
+  pitch_class  : int   0-11  (0 for REST)
+  octave       : float 0-1   (0 for REST)
   log_duration : float normalized log2 duration
-  beat_sin     : float sin(2π * beat_position)
-  beat_cos     : float cos(2π * beat_position)
-  velocity     : float 0-1
-  voice        : int   0-15
+  beat_sin     : float sin(2π * beat_bin/16)
+  beat_cos     : float cos(2π * beat_bin/16)
+  velocity     : float 0-1   (0 for REST)
+  voice        : int   0-15  (0 for REST)
 """
 
 import os
@@ -28,23 +27,32 @@ import math
 import struct
 import pickle
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 
 # ── Musical duration grid ──────────────────────────────────────────────────────
 
 MUSICAL_DURS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+N_BEAT_BINS  = 16
 
 def snap_duration(dur_beats: float) -> float:
-    """Snap to nearest musical duration value."""
     return min(MUSICAL_DURS, key=lambda x: abs(x - dur_beats))
 
 def dur_to_log_norm(dur_q: float) -> float:
-    """log2(dur) normalized to [-1, 1] over [0.25, 4.0] range."""
     log_raw = math.log2(dur_q + 1e-4)
-    # log2(0.25) = -2, log2(4.0) = 2
     norm = (log_raw - (-2.0)) / (2.0 - (-2.0)) * 2.0 - 1.0
     return max(-1.0, min(1.0, norm))
+
+def quantize_beat(abs_tick: int, tpb: int) -> int:
+    """Return beat bin 0-15 (16 bins per 4/4 bar = 16th-note resolution)."""
+    ticks_per_bar  = tpb * 4
+    tick_in_bar    = abs_tick % ticks_per_bar
+    bin_size       = ticks_per_bar / N_BEAT_BINS
+    return int(tick_in_bar / bin_size) % N_BEAT_BINS
+
+def beat_bin_to_sincos(beat_bin: int) -> Tuple[float, float]:
+    angle = 2.0 * math.pi * beat_bin / N_BEAT_BINS
+    return math.sin(angle), math.cos(angle)
 
 
 # ── MIDI Parser ────────────────────────────────────────────────────────────────
@@ -53,7 +61,7 @@ def parse_midi(path: str):
     """
     Parse MIDI file. Returns (ticks_per_beat, notes).
     notes: list of (abs_tick, pitch, velocity, duration_ticks, channel)
-    Sorted by (abs_tick, pitch) — deterministic polyphony ordering.
+    Sorted by (abs_tick, pitch).
     """
     with open(path, 'rb') as f:
         data = f.read()
@@ -114,7 +122,6 @@ def parse_midi(path: str):
                 while tp < len(track_data) and track_data[tp] != 0xf7: tp += 1
                 tp += 1
 
-    # Match note-on to note-off for durations
     active = {}
     notes  = []
     for ev in sorted(all_raw, key=lambda e: e[1]):
@@ -140,45 +147,84 @@ def parse_midi(path: str):
 
 def note_to_token(pitch: int, vel: int, dur_ticks: int, channel: int,
                   abs_tick: int, tpb: int) -> dict:
-    """
-    Convert a raw note to:
-      'key'    : (pitch, dur_snapped) — vocab identity
-      'fields' : dict of 7 DNA float/int values
-    """
     dur_beats   = dur_ticks / tpb
     dur_snapped = snap_duration(dur_beats)
     log_dur     = dur_to_log_norm(dur_snapped)
-
+    beat_bin    = quantize_beat(abs_tick, tpb)
+    bs, bc      = beat_bin_to_sincos(beat_bin)
     pitch_class = pitch % 12
     octave      = min(pitch // 12, 8) / 8.0
 
-    # Beat position within bar (assume 4/4, good enough for quantization)
-    beat_in_bar = (abs_tick % (tpb * 4)) / tpb
-    beat_frac   = beat_in_bar - int(beat_in_bar)
-    # Quantize beat to nearest 16th
-    beat_q      = round(beat_frac * 4) / 4 % 1.0
-    beat_angle  = 2.0 * math.pi * beat_q
-
     return {
-        'key': (pitch, dur_snapped),
+        'key': ('note', pitch, dur_snapped, beat_bin),
         'fields': {
             'pitch_class':  pitch_class,
             'octave':       octave,
             'log_duration': log_dur,
-            'beat_sin':     math.sin(beat_angle),
-            'beat_cos':     math.cos(beat_angle),
+            'beat_sin':     bs,
+            'beat_cos':     bc,
             'velocity':     min(vel, 127) / 127.0,
             'voice':        min(channel, 15),
         }
     }
+
+def rest_to_token(dur_beats: float, abs_tick: int, tpb: int) -> dict:
+    dur_snapped = snap_duration(dur_beats)
+    log_dur     = dur_to_log_norm(dur_snapped)
+    beat_bin    = quantize_beat(abs_tick, tpb)
+    bs, bc      = beat_bin_to_sincos(beat_bin)
+
+    return {
+        'key': ('rest', None, dur_snapped, beat_bin),
+        'fields': {
+            'pitch_class':  0,
+            'octave':       0.0,
+            'log_duration': log_dur,
+            'beat_sin':     bs,
+            'beat_cos':     bc,
+            'velocity':     0.0,
+            'voice':        0,
+        }
+    }
+
+
+def extract_rests(notes: list, tpb: int) -> list:
+    """
+    Interleave REST tokens into a sorted note list wherever there is a gap
+    between consecutive note onsets greater than one 16th note (tpb/4 ticks).
+    Returns a new list of dicts: {'type': 'note'|'rest', 'abs_tick': int, ...}
+    """
+    if not notes:
+        return []
+
+    min_gap = tpb / 4  # 16th note minimum gap to insert a rest
+
+    result = []
+    for i, n in enumerate(notes):
+        abs_tick, pitch, vel, dur_ticks, ch = n
+        result.append({'type': 'note', 'abs_tick': abs_tick,
+                       'pitch': pitch, 'vel': vel,
+                       'dur_ticks': dur_ticks, 'ch': ch})
+
+        if i + 1 < len(notes):
+            next_tick = notes[i + 1][0]
+            gap_ticks = next_tick - abs_tick
+            if gap_ticks > min_gap:
+                gap_beats = gap_ticks / tpb
+                gap_snapped = snap_duration(gap_beats)
+                result.append({'type': 'rest', 'abs_tick': abs_tick + dur_ticks,
+                               'dur_beats': gap_snapped})
+
+    return result
 
 
 # ── Tokenizer ──────────────────────────────────────────────────────────────────
 
 class FMTokenizer:
     """
-    Vocab: (pitch, snapped_duration) tuples observed in corpus.
-    Special: PAD=0, BOS=1, EOS=2. Note tokens start at index 3.
+    Vocab: (event_type, pitch_or_none, snapped_duration, beat_bin) tuples.
+    Special: PAD=0, BOS=1, EOS=2. Tokens start at index 3.
+    REST tokens have pitch_or_none=None, pitch_class/octave/velocity/voice=0.
     idx_to_fields: exact DNA floats per vocab index, used for generation.
     """
 
@@ -206,15 +252,20 @@ class FMTokenizer:
             print(f"  Building vocabulary from {len(files)} MIDI files...")
 
         seen_keys = set()
-        # Also store representative fields per key for generation
         key_fields: Dict[tuple, dict] = {}
         errors = 0
 
         for path in files:
             try:
                 tpb, notes = parse_midi(path)
-                for (abs_tick, pitch, vel, dur_ticks, ch) in notes:
-                    t = note_to_token(pitch, vel, dur_ticks, ch, abs_tick, tpb)
+                events = extract_rests(notes, tpb)
+                for ev in events:
+                    if ev['type'] == 'note':
+                        t = note_to_token(ev['pitch'], ev['vel'],
+                                          ev['dur_ticks'], ev['ch'],
+                                          ev['abs_tick'], tpb)
+                    else:
+                        t = rest_to_token(ev['dur_beats'], ev['abs_tick'], tpb)
                     k = t['key']
                     seen_keys.add(k)
                     if k not in key_fields:
@@ -222,9 +273,8 @@ class FMTokenizer:
             except Exception:
                 errors += 1
 
-        # Build vocab
         self.idx_to_fields = [None, None, None]  # PAD, BOS, EOS
-        for key in sorted(seen_keys):
+        for key in sorted(seen_keys, key=lambda k: (k[0], k[2] or 0.0, k[1] or 0, k[3])):
             idx = len(self.idx_to_fields)
             self.key_to_idx[key] = idx
             self.idx_to_key[idx] = key
@@ -232,9 +282,12 @@ class FMTokenizer:
 
         self._built = True
 
+        n_rest = sum(1 for k in seen_keys if k[0] == 'rest')
+        n_note = sum(1 for k in seen_keys if k[0] == 'note')
+
         if verbose:
             print(f"  Vocabulary: {self.vocab_size} tokens "
-                  f"({self.vocab_size - self.SPECIAL} note types + 3 special)")
+                  f"({n_note} note types + {n_rest} rest types + 3 special)")
             if errors:
                 print(f"  Warning: {errors} files failed to parse")
         return self
@@ -248,13 +301,21 @@ class FMTokenizer:
         if not notes:
             return None
 
+        events = extract_rests(notes, tpb)
+
         out = {k: [] for k in [
             'pitch_class', 'octave', 'log_duration',
             'beat_sin', 'beat_cos', 'velocity', 'voice', 'token_idx'
         ]}
 
-        for (abs_tick, pitch, vel, dur_ticks, ch) in notes:
-            t   = note_to_token(pitch, vel, dur_ticks, ch, abs_tick, tpb)
+        for ev in events:
+            if ev['type'] == 'note':
+                t = note_to_token(ev['pitch'], ev['vel'],
+                                  ev['dur_ticks'], ev['ch'],
+                                  ev['abs_tick'], tpb)
+            else:
+                t = rest_to_token(ev['dur_beats'], ev['abs_tick'], tpb)
+
             idx = self.key_to_idx.get(t['key'], self.PAD)
             f   = t['fields']
             out['pitch_class'].append(f['pitch_class'])
@@ -270,9 +331,9 @@ class FMTokenizer:
 
     def tokenize_corpus(self, midi_dir: str,
                         verbose: bool = True) -> List[Dict[str, list]]:
-        files    = [str(p) for p in Path(midi_dir).rglob('*.mid')]
-        seqs     = []
-        errors   = 0
+        files  = [str(p) for p in Path(midi_dir).rglob('*.mid')]
+        seqs   = []
+        errors = 0
         for i, path in enumerate(files):
             r = self.tokenize_file(path)
             if r is not None: seqs.append(r)
@@ -285,6 +346,17 @@ class FMTokenizer:
             print(f"  Lengths: min={min(lengths)} max={max(lengths)} "
                   f"mean={sum(lengths)//len(lengths)}")
         return seqs
+
+    def is_rest(self, idx: int) -> bool:
+        key = self.idx_to_key.get(idx)
+        return key is not None and key[0] == 'rest'
+
+    def get_duration_beats(self, idx: int) -> float:
+        """Return snapped duration in beats for a given token index."""
+        key = self.idx_to_key.get(idx)
+        if key is None:
+            return 0.25
+        return key[2]  # snapped_duration
 
     def save(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -307,7 +379,10 @@ class FMTokenizer:
         return tok
 
     def stats(self) -> dict:
+        n_rest = sum(1 for k in self.idx_to_key.values() if k[0] == 'rest')
+        n_note = sum(1 for k in self.idx_to_key.values() if k[0] == 'note')
         return {
-            'vocab_size':  self.vocab_size,
-            'note_types':  self.vocab_size - self.SPECIAL,
+            'vocab_size': self.vocab_size,
+            'note_types': n_note,
+            'rest_types': n_rest,
         }

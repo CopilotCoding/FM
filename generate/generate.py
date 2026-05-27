@@ -59,10 +59,19 @@ def tokens_to_midi(token_indices: list, tokenizer: FMTokenizer,
         if fields is None:
             continue
 
+        # Advance by actual predicted duration (beats -> ticks)
+        dur_beats = tokenizer.get_duration_beats(idx)
+        dur_ticks_advance = max(int(dur_beats * tpb), 1)
+
+        # REST token: advance time, emit no note
+        if tokenizer.is_rest(idx):
+            cur_tick += dur_ticks_advance
+            continue
+
         pitch, vel, dur_ticks, ch = fields_to_midi_note(fields, tpb)
         events.append(('on',  cur_tick,              ch, pitch, vel))
         events.append(('off', cur_tick + dur_ticks,  ch, pitch, 0))
-        cur_tick += max(int(tpb * 0.25), 1)  # advance by one 16th note
+        cur_tick += dur_ticks_advance
 
     events.sort(key=lambda e: e[1])
 

@@ -14,13 +14,17 @@ Core idea:
 Architecture:
   note_DNA(23) → Linear(23, 4096) → * pos_encoding(pos, base=32768) → cumsum → 3-layer decoder → logits
 
+Token types:
+  NOTE(pitch, dur, beat_bin) — carries full DNA geometry
+  REST(dur, beat_bin)        — pitch_class/octave/velocity/voice zeroed; time passes, no pitch
+
 Token DNA (23 dims, structured geometry):
-  pitch_class : sin(2π*pc/12), cos(2π*pc/12)   — circular,  2 dims
-  octave      : octave / 8                       — linear,    1 dim
+  pitch_class : sin(2π*pc/12), cos(2π*pc/12)   — circular,  2 dims  (0 for REST)
+  octave      : octave / 8                       — linear,    1 dim   (0 for REST)
   duration    : log2(dur + ε) normalized         — log,       1 dim
-  beat_pos    : sin(2π*beat), cos(2π*beat)       — circular,  2 dims
-  velocity    : vel / 127                        — linear,    1 dim
-  voice       : learned embedding                — learned,  16 dims
+  beat_pos    : sin(2π*beat_bin/16), cos(...)    — circular,  2 dims  (16-bin quantized)
+  velocity    : vel / 127                        — linear,    1 dim   (0 for REST)
+  voice       : learned embedding                — learned,  16 dims  (0 for REST)
   ─────────────────────────────────────────────────────────────────
   total fixed  : 7 dims
   total learned: 16 dims
