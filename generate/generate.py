@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from data.tokenizer import FMTokenizer, parse_midi, note_to_fields
+from data.tokenizer import FMTokenizer, parse_midi
 from model.fm       import FM
 
 
