@@ -89,7 +89,7 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 **Hardware:** RTX 5060 Ti (16GB VRAM)  
 **Dataset:** 201 Bach MIDI files, 532 vocab tokens, sequences 120–24,203 notes  
 **Parameters:** 13.78M  
-**VRAM:** 0.64GB allocated, 7.5GB reserved (PyTorch allocator)  
+**VRAM:** 0.64GB allocated, 7.5GB reserved (PyTorch allocator) FM appears to actively train in well under 1 GB of tensor allocation, while PyTorch reserves several GB during execution.
 **Batch size:** 1 (full files, no padding, no windowing)
 
 | Epoch | Avg. Loss | Note |
