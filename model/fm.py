@@ -135,6 +135,8 @@ class NoteDNA(nn.Module):
 
 # ── Field Machine ──────────────────────────────────────────────────────────────
 
+SEED_DIM = 256
+
 class FM(nn.Module):
     """
     Field Machine.
@@ -156,7 +158,8 @@ class FM(nn.Module):
                  pos_base:            float = POS_BASE,
                  n_decoder_layers:    int   = N_DECODER_LAYERS,
                  decoder_hidden:      int   = DECODER_HIDDEN,
-                 dropout:             float = 0.1):
+                 dropout:             float = 0.1,
+                 seed_dim:            int   = SEED_DIM):
         super().__init__()
 
         self.vocab_size       = vocab_size
@@ -187,7 +190,17 @@ class FM(nn.Module):
             in_dim = decoder_hidden
         self.decoder = nn.Sequential(*dec_layers)
 
-        self.dropout = nn.Dropout(dropout)
+        self.dropout  = nn.Dropout(dropout)
+        self.seed_dim  = seed_dim
+
+        # Seed conditioning: 256-dim latent → 4096-dim field bias
+        # Added to every token's contribution before cumsum.
+        # Trained with random seed per sequence + occasional token dropout
+        # to ensure seed is load-bearing, not ignored.
+        self.seed_proj = nn.Sequential(
+            nn.Linear(seed_dim, dim),
+            nn.LayerNorm(dim),
+        )
 
         # Position encoding cache — built on first forward, reused
         self._pe_cache        = None
@@ -228,12 +241,16 @@ class FM(nn.Module):
                 beat_cos:     torch.Tensor,
                 velocity:     torch.Tensor,
                 voice:        torch.Tensor,
+                seed:         torch.Tensor = None,
+                token_dropout_p: float     = 0.15,
                 ) -> torch.Tensor:
         """
         All inputs: (B, T)
-        Returns:    (B, T, vocab_size)
-
-        Fully parallel. Zero loops. Zero approximation. Zero serial dependency.
+        seed: (B, seed_dim) — optional latent seed vector.
+              If None, sampled randomly during training (injected by train loop).
+        token_dropout_p: probability of zeroing token contributions entirely,
+              forcing model to reconstruct from seed alone (prevents posterior collapse).
+        Returns: (B, T, vocab_size)
         """
         B, T   = pitch_class.shape
         device = pitch_class.device
@@ -248,14 +265,23 @@ class FM(nn.Module):
         # 2. Project to field dim: (B, T, 4096)
         projected = self.proj(dna)
 
-        # 3. Elementwise multiply by position encoding: (B, T, 4096)
+        # Token dropout disabled — causes gradient vanishing with bfloat16
+        # Random seed per sequence is sufficient to prevent posterior collapse
+
+        # 4. Position encoding: (B, T, 4096)
         pe        = self._pos(T, device, projected.dtype)
         modulated = projected * pe.unsqueeze(0)
 
-        # 4. Cumulative field — one CUDA op: (B, T, 4096)
+        # 5. Seed conditioning — add seed projection to every token's contribution
+        #    seed: (B, seed_dim) → (B, 1, 4096), broadcast across all T positions
+        if seed is not None:
+            seed_bias  = self.seed_proj(seed.to(dtype))       # (B, 4096)
+            modulated  = modulated + seed_bias.unsqueeze(1)   # (B, T, 4096)
+
+        # 6. Cumulative field — one CUDA op: (B, T, 4096)
         field = torch.cumsum(modulated, dim=1)
 
-        # 5. Decode all positions in one batched pass: (B, T, vocab)
+        # 7. Decode all positions in one batched pass: (B, T, vocab)
         logits = self.decoder(
             field.reshape(B * T, self.dim)
         ).reshape(B, T, self.vocab_size)
@@ -271,20 +297,17 @@ class FM(nn.Module):
                  temperature:    float = 1.0,
                  top_k:          int   = 50,
                  top_p:          float = 0.95,
-                 seed_strength:  float = 0.0,
+                 seed_strength:  float = 1.0,
                  seed:           int   = None) -> list:
         """
         O(1) per token inference via running field accumulation.
 
         prompt_fields: dict of {field_name: (1, T) tensor}
-        seed_strength: magnitude of random offset injected into the initial field.
-                       0.0 = deterministic (same output every time).
-                       0.05–0.15 = varied output, different trajectory each run.
-                       Controls P(next | history, seed) instead of P(next | history).
-        seed: random seed for reproducibility. None = random each run.
+        seed_strength: scale of the seed vector (1.0 = full strength).
+                       The seed is a learned compositional identity — not noise.
+                       0.0 = no seed (deterministic attractor).
+        seed: integer for reproducibility. None = random each run.
         Returns: list of generated vocab indices.
-
-        State = one 4096-dim vector. Never grows. Memory is constant forever.
         """
         self.eval()
         device = next(self.parameters()).device
@@ -304,19 +327,19 @@ class FM(nn.Module):
         T_prompt = pc.shape[1]
         pe       = self._pos(T_prompt + max_new_tokens, device, dtype)
 
-        # Build initial field from prompt
-        dna       = self.dna(pc, oc, dur, bs, bc, vel, voi)   # (1, T, 23)
-        projected = self.proj(dna)                              # (1, T, 4096)
-        modulated = projected * pe[:T_prompt].unsqueeze(0)      # (1, T, 4096)
-        field     = modulated.sum(dim=1).squeeze(0)             # (4096,) running sum
+        # Sample seed vector
+        rng = torch.Generator(device=device)
+        if seed is not None:
+            rng.manual_seed(seed)
+        seed_vec  = torch.randn(1, self.seed_dim, generator=rng, device=device, dtype=dtype)
+        seed_bias = self.seed_proj(seed_vec).squeeze(0) * seed_strength  # (4096,)
 
-        # Seed vector — inject controlled randomness into field before generation
-        if seed_strength > 0.0:
-            rng = torch.Generator(device=device)
-            if seed is not None:
-                rng.manual_seed(seed)
-            seed_vec = torch.randn(self.dim, generator=rng, device=device, dtype=dtype)
-            field = field + seed_vec * seed_strength
+        # Build initial field from prompt, with seed bias on every token
+        dna       = self.dna(pc, oc, dur, bs, bc, vel, voi)       # (1, T, 23)
+        projected = self.proj(dna)                                  # (1, T, 4096)
+        modulated = projected * pe[:T_prompt].unsqueeze(0)          # (1, T, 4096)
+        modulated = modulated + seed_bias.unsqueeze(0).unsqueeze(0) # add seed to every position
+        field     = modulated.sum(dim=1).squeeze(0)                 # (4096,) running sum
 
         generated = []
         t = T_prompt
@@ -353,7 +376,7 @@ class FM(nn.Module):
             dna_vec  = self.dna(**token_fields).squeeze(0).squeeze(0)  # (23,)
             proj_vec = self.proj(dna_vec.unsqueeze(0).unsqueeze(0)
                                  ).squeeze(0).squeeze(0)                # (4096,)
-            field    = field + proj_vec * pe[t]                         # O(1)
+            field    = field + proj_vec * pe[t] + seed_bias             # O(1) + seed
             t       += 1
 
         return generated

@@ -258,6 +258,7 @@ def train(args):
         'decoder_layers': args.decoder_layers,
         'decoder_hidden': args.decoder_hidden,
         'dropout':        args.dropout,
+        'seed_dim':       256,
         'parameters':     model.count_parameters(),
         'pos_base':       32768,
     }
@@ -348,6 +349,11 @@ def train(args):
             for step, batch in enumerate(loader):
                 step_start = time.time()
                 batch      = batch_to_device(batch, device)
+                B          = batch['pitch_class'].shape[0]
+
+                # Sample fresh random seed per batch — model learns seed = compositional identity
+                seed_vec = torch.randn(B, model.seed_dim, device=device,
+                                       dtype=dtype if dtype else torch.float32)
 
                 with torch.amp.autocast('cuda', dtype=dtype, enabled=use_amp):
                     logits = model(
@@ -358,6 +364,7 @@ def train(args):
                         beat_cos     = batch['beat_cos'],
                         velocity     = batch['velocity'],
                         voice        = batch['voice'],
+                        seed         = seed_vec,
                     )
                     B, T, V = logits.shape
                     loss = criterion(
