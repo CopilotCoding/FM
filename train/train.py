@@ -36,6 +36,7 @@ from collections import deque
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -306,6 +307,24 @@ def train(args):
     tokens_total    = 0
     recent_losses   = deque(maxlen=100)
 
+    # Cluster sequences by musical similarity, assign consistent seeds per cluster.
+    # Sequences in the same cluster get nearby seeds, different clusters get distant seeds.
+    # This mirrors musical space in seed space from the start of training.
+    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
+                  console=console, transient=True) as p:
+        p.add_task("Clustering sequences for seed assignment...", total=None)
+        from data.preprocess import cluster_sequences_to_seeds
+        # Build sequence list for clustering (load token indices from dataset)
+        cluster_seqs = [{'token_idx': dataset._get_token_indices(i)}
+                        for i in range(len(dataset))]
+        fixed_seeds = cluster_sequences_to_seeds(
+            cluster_seqs, n_clusters=min(16, len(cluster_seqs)), seed_dim=model.seed_dim
+        )
+    console.print(f"[green]✓[/] Seed assignment: {len(fixed_seeds)} sequences → {min(16, len(dataset))} clusters")
+
+    # Rolling field buffer for contrastive consistency loss
+    field_buffer = []
+
     # Two-level progress: epochs (outer) + steps (inner)
     epoch_progress = Progress(
         TextColumn("[bold blue]Epoch {task.completed}/{task.total}"),
@@ -350,13 +369,28 @@ def train(args):
                 step_start = time.time()
                 batch      = batch_to_device(batch, device)
                 B          = batch['pitch_class'].shape[0]
+                sdtype     = dtype if dtype else torch.float32
 
-                # Sample fresh random seed per batch — model learns seed = compositional identity
-                seed_vec = torch.randn(B, model.seed_dim, device=device,
-                                       dtype=dtype if dtype else torch.float32)
+                # ── Seed annealing: std grows 0.3→1.0 over training ──────────
+                anneal_progress = global_step / max(total_steps, 1)
+                seed_std        = 0.3 + 0.7 * anneal_progress
+
+                # ── Fixed seed assignment per sequence ────────────────────────
+                # Each sequence index gets a consistent seed across epochs.
+                # Model learns "this seed = this compositional identity."
+                seq_indices = batch.get('seq_idx', None)
+                if seq_indices is not None:
+                    seed_a = torch.stack([
+                        fixed_seeds[int(idx.item()) % len(fixed_seeds)]
+                        for idx in seq_indices
+                    ]).to(device=device, dtype=sdtype) * seed_std
+                else:
+                    seed_a = torch.randn(B, model.seed_dim, device=device, dtype=sdtype) * seed_std
+                seed_b = torch.randn(B, model.seed_dim, device=device, dtype=sdtype) * seed_std
 
                 with torch.amp.autocast('cuda', dtype=dtype, enabled=use_amp):
-                    logits = model(
+                    # Single forward pass with seed_a, return field for contrastive
+                    logits, field_a = model(
                         pitch_class  = batch['pitch_class'],
                         octave       = batch['octave'],
                         log_duration = batch['log_duration'],
@@ -364,13 +398,56 @@ def train(args):
                         beat_cos     = batch['beat_cos'],
                         velocity     = batch['velocity'],
                         voice        = batch['voice'],
-                        seed         = seed_vec,
+                        seed         = seed_a,
+                        return_field = True,
                     )
-                    B, T, V = logits.shape
-                    loss = criterion(
-                        logits.reshape(B * T, V),
-                        batch['target'].reshape(B * T),
+                    B_, T, V = logits.shape
+
+                    # Task loss
+                    loss_task = criterion(
+                        logits.reshape(B_ * T, V),
+                        batch['target'].reshape(B_ * T),
                     )
+
+                    # Gain mask diversity loss — penalize similar gain masks
+                    # No extra forward pass — just two seed_proj calls
+                    gain_a   = model._seed_gain(seed_a, sdtype)  # (B, dim)
+                    gain_b   = model._seed_gain(seed_b, sdtype)  # (B, dim)
+                    loss_gain_div = F.cosine_similarity(gain_a, gain_b, dim=-1).mean()
+
+                    # Contrastive loss on field states
+                    # Same seed, different sequences → fields should be similar
+                    # Different seeds, same sequence → fields should be far apart
+                    # Compute field_b cheaply: reuse projected tokens from field_a
+                    # field_b ≈ cumsum(projected * pe * gain_b) — no DNA/proj recompute
+                    # We approximate by just computing gain_b field from scratch on a
+                    # rolling buffer comparison
+                    field_b_approx = field_a.detach() * (gain_b / (gain_a.detach() + 1e-6))
+                    loss_contrastive = F.cosine_similarity(
+                        field_a, field_b_approx.detach(), dim=-1
+                    ).mean()
+
+                    # Rolling buffer: same seed applied to previous sequence's field
+                    # should give similar result (seed = consistent identity)
+                    if field_buffer:
+                        prev_field, prev_seed = field_buffer[-1]
+                        # Same seed_a on different sequence — should be similar
+                        same_seed_diff_seq = F.cosine_similarity(
+                            field_a.detach(), prev_field, dim=-1
+                        ).mean()
+                        loss_consistency = -same_seed_diff_seq  # maximize similarity
+                    else:
+                        loss_consistency = torch.tensor(0.0, device=device)
+
+                    # Update rolling buffer
+                    field_buffer.append((field_a.detach().mean(0, keepdim=True), seed_a.detach().mean(0, keepdim=True)))
+                    if len(field_buffer) > 8:
+                        field_buffer.pop(0)
+
+                    loss = (loss_task
+                            + 0.15 * loss_gain_div
+                            + 0.10 * loss_contrastive
+                            + 0.05 * loss_consistency)
 
                 optimizer.zero_grad()
                 if use_scaler:

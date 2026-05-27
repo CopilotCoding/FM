@@ -172,8 +172,9 @@ def generate(args):
             t = t.long()
         prompt[k] = t
 
+    interp_str = f" | lerp seed_b={args.seed_b} alpha={args.alpha}" if args.seed_b is not None else ""
     print(f"\nGenerating {args.tokens} tokens...")
-    print(f"  Temperature: {args.temperature} | top_k: {args.top_k} | top_p: {args.top_p} | seed_strength: {args.seed_strength} | seed: {args.seed}")
+    print(f"  Temperature: {args.temperature} | top_k: {args.top_k} | top_p: {args.top_p} | seed: {args.seed}{interp_str}")
 
     with torch.amp.autocast('cuda', dtype=dtype, enabled=(device.type=='cuda')):
         generated = model.generate(
@@ -182,8 +183,9 @@ def generate(args):
             temperature    = args.temperature,
             top_k          = args.top_k,
             top_p          = args.top_p,
-            seed_strength  = args.seed_strength,
             seed           = args.seed,
+            seed_b         = args.seed_b,
+            alpha          = args.alpha,
         )
 
     print(f"  Generated {len(generated)} tokens")
@@ -203,7 +205,8 @@ if __name__ == '__main__':
     parser.add_argument('--temperature',  type=float, default=0.85,   help='Sampling temperature')
     parser.add_argument('--top_k',          type=int,   default=50)
     parser.add_argument('--top_p',          type=float, default=0.95)
-    parser.add_argument('--seed_strength',  type=float, default=0.05,  help='Field seed offset magnitude (0=off, 0.05–0.15 recommended)')
-    parser.add_argument('--seed',           type=int,   default=None,   help='Random seed for reproducibility (None=random each run)')
+    parser.add_argument('--seed',    type=int,   default=None, help='Seed integer (None=random)')
+    parser.add_argument('--seed_b',  type=int,   default=None, help='Second seed for interpolation')
+    parser.add_argument('--alpha',   type=float, default=0.5,  help='Interpolation weight: alpha*seed + (1-alpha)*seed_b')
     args = parser.parse_args()
     generate(args)

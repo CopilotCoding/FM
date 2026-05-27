@@ -53,6 +53,14 @@ class FMDataset(Dataset):
         self.sequences = [s for s in sequences if len(s['token_idx']) >= min_len]
         self._mode     = 'legacy'
 
+    def _get_token_indices(self, idx):
+        """Return raw token index list for clustering."""
+        if self._mode == 'bin':
+            start, length = self.offsets[idx]
+            return self.tokens[start:start+length].tolist()
+        else:
+            return self.sequences[idx]['token_idx']
+
     def __len__(self):
         if self._mode == 'bin':
             return len(self.offsets)

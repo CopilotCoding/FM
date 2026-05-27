@@ -315,3 +315,74 @@ def build_cache(midi_dir: str, out_dir: str, min_seq_len: int = 8,
         json.dump(meta, f, indent=2)
 
     return tok, out_dir
+
+
+def cluster_sequences_to_seeds(sequences, n_clusters=16, seed_dim=256):
+    """
+    Cluster sequences by token frequency distribution, assign seed centroids.
+    Returns: list of seed tensors, one per sequence.
+    Seeds within the same cluster are nearby in seed space — reflecting musical similarity.
+    Seeds from different clusters are distant — forcing the model to learn real separation.
+
+    Uses k-means on token unigram distributions (fast, no dependencies).
+    """
+    import math, random
+
+    vocab_size = max(max(s['token_idx']) for s in sequences) + 1
+
+    # Build token frequency vectors
+    freqs = []
+    for s in sequences:
+        counts = [0.0] * vocab_size
+        for idx in s['token_idx']:
+            counts[idx] += 1.0
+        total = sum(counts) + 1e-8
+        freqs.append([c / total for c in counts])
+
+    # Simple k-means
+    random.seed(42)
+    centroids = random.sample(freqs, min(n_clusters, len(freqs)))
+    assignments = [0] * len(freqs)
+
+    for _ in range(20):  # 20 iterations
+        # Assign
+        for i, f in enumerate(freqs):
+            best_c, best_d = 0, float('inf')
+            for c, centroid in enumerate(centroids):
+                d = sum((a - b) ** 2 for a, b in zip(f, centroid))
+                if d < best_d:
+                    best_d = d; best_c = c
+            assignments[i] = best_c
+
+        # Update centroids
+        new_centroids = [[0.0] * vocab_size for _ in range(n_clusters)]
+        counts_c = [0] * n_clusters
+        for i, c in enumerate(assignments):
+            for j in range(vocab_size):
+                new_centroids[c][j] += freqs[i][j]
+            counts_c[c] += 1
+        for c in range(n_clusters):
+            if counts_c[c] > 0:
+                centroids[c] = [x / counts_c[c] for x in new_centroids[c]]
+
+    # Build fixed seed vectors — cluster centroid + small noise
+    # Centroids are projected to seed_dim via random projection (fast approximation)
+    import torch
+    torch.manual_seed(42)
+    proj = torch.randn(vocab_size, seed_dim) * 0.1
+
+    cluster_seeds = []
+    for c in range(n_clusters):
+        centroid_t = torch.tensor(centroids[c], dtype=torch.float32)
+        seed = centroid_t @ proj  # (seed_dim,)
+        seed = seed / (seed.norm() + 1e-8)  # normalize
+        cluster_seeds.append(seed)
+
+    # Assign seeds with small per-sequence noise
+    sequence_seeds = []
+    for i, s in enumerate(sequences):
+        c = assignments[i]
+        noise = torch.randn(seed_dim) * 0.1
+        sequence_seeds.append(cluster_seeds[c] + noise)
+
+    return sequence_seeds

@@ -12,36 +12,16 @@ Core idea:
   O(1) inference — field is a running sum, each new token adds one vector.
 
 Architecture:
-  note_DNA(23) → Linear(23, 4096) → * pos_encoding(pos, base=32768) → cumsum → 3-layer decoder → logits
+  note_DNA(23) → Linear(23, 4096) → * pos_encoding(pos, base=32768) → * seed_gain → cumsum → 3-layer decoder → logits
 
-Token types:
-  NOTE(pitch, dur, beat_bin) — carries full DNA geometry
-  REST(dur, beat_bin)        — pitch_class/octave/velocity/voice zeroed; time passes, no pitch
-
-Token DNA (23 dims, structured geometry):
-  pitch_class : sin(2π*pc/12), cos(2π*pc/12)   — circular,  2 dims  (0 for REST)
-  octave      : octave / 8                       — linear,    1 dim   (0 for REST)
-  duration    : log2(dur + ε) normalized         — log,       1 dim
-  beat_pos    : sin(2π*beat_bin/16), cos(...)    — circular,  2 dims  (16-bin quantized)
-  velocity    : vel / 127                        — linear,    1 dim   (0 for REST)
-  voice       : learned embedding                — learned,  16 dims  (0 for REST)
-  ─────────────────────────────────────────────────────────────────
-  total fixed  : 7 dims
-  total learned: 16 dims
-  total        : 23 dims
-
-Position encoding:
-  Analytic sinusoidal, base=32768.
-  pos_vec[i, 2k]   = sin(i / 32768^(2k/4096))
-  pos_vec[i, 2k+1] = cos(i / 32768^(2k/4096))
-  Fixed. No parameters. Generalizes to any length. Maximally orthogonal up to 32768.
-
-Field accumulation:
-  field[t] = cumsum(project(dna) * pos_vec, dim=1)[t]
-
-Inference O(1):
-  field_t = field_{t-1} + project(dna(token_t)) * pos_vec[t]
-  State is one 4096-dim vector. Never grows.
+Seed conditioning:
+  seed ∈ R^256 → seed_proj → sigmoid * 3.0 → gain ∈ (0,1)^4096
+  gain multiplied into every token's field contribution — structurally load-bearing.
+  Per-layer decoder seeds: each decoder layer gated by a separate seed projection.
+  Contrastive loss: different seeds on same sequence → different fields (forced separation).
+  Diversity loss: gain masks from different seeds penalized for similarity.
+  Fixed seed assignment: each training sequence assigned a consistent seed across epochs.
+  Seed annealing: seed std grows from 0.3→1.0 over training for coarse→fine curriculum.
 """
 
 import math
@@ -58,26 +38,19 @@ VOICE_DIM         = 16
 N_VOICES          = 16
 POS_BASE          = 32768.0
 N_DECODER_LAYERS  = 3
-DECODER_HIDDEN    = 2048   # 4096 * 0.5
+DECODER_HIDDEN    = 2048
+SEED_DIM          = 256
+SEED_SIGMOID_SCALE = 3.0
 
 
 # ── Position Encoding ──────────────────────────────────────────────────────────
 
 def build_pos_encoding(seq_len: int, dim: int, base: float,
                        device, dtype) -> torch.Tensor:
-    """
-    Analytic sinusoidal position encoding matrix: (seq_len, dim).
-    pos[i, 2k]   = sin(i / base^(2k/dim))
-    pos[i, 2k+1] = cos(i / base^(2k/dim))
-
-    Maximally orthogonal across positions for sequences up to length `base`.
-    Fixed forever — no parameters, no training, no gradient.
-    Generalizes to any sequence length.
-    """
     i    = torch.arange(seq_len, dtype=torch.float32, device=device).unsqueeze(1)
     k    = torch.arange(0, dim, 2, dtype=torch.float32, device=device)
-    freq = 1.0 / (base ** (k / dim))                  # (dim/2,)
-    ang  = i * freq.unsqueeze(0)                       # (seq_len, dim/2)
+    freq = 1.0 / (base ** (k / dim))
+    ang  = i * freq.unsqueeze(0)
     pe   = torch.empty(seq_len, dim, dtype=torch.float32, device=device)
     pe[:, 0::2] = torch.sin(ang)
     pe[:, 1::2] = torch.cos(ang)
@@ -87,79 +60,38 @@ def build_pos_encoding(seq_len: int, dim: int, base: float,
 # ── Token DNA Encoder ──────────────────────────────────────────────────────────
 
 class NoteDNA(nn.Module):
-    """
-    Encodes a structured MIDI note event into a 23-dimensional DNA vector.
-
-    Every dimension has geometry that matches the musical concept it encodes:
-      - Pitch class is circular  → unit circle encoding
-      - Octave is linear         → normalized scalar
-      - Duration is logarithmic  → log2 normalized scalar
-      - Beat position is circular → unit circle encoding
-      - Velocity is linear       → normalized scalar
-      - Voice is categorical     → small learned embedding
-
-    This is not a lookup table. The geometry is real before training begins.
-    """
     def __init__(self, n_voices: int = N_VOICES, voice_dim: int = VOICE_DIM):
         super().__init__()
         self.voice_embed = nn.Embedding(n_voices, voice_dim)
         nn.init.normal_(self.voice_embed.weight, std=0.02)
 
-    def forward(self,
-                pitch_class:   torch.Tensor,   # (B, T) int 0-11
-                octave:        torch.Tensor,   # (B, T) float 0-1
-                log_duration:  torch.Tensor,   # (B, T) float normalized
-                beat_sin:      torch.Tensor,   # (B, T) float
-                beat_cos:      torch.Tensor,   # (B, T) float
-                velocity:      torch.Tensor,   # (B, T) float 0-1
-                voice:         torch.Tensor,   # (B, T) int 0-15
-                ) -> torch.Tensor:             # (B, T, 23)
-
+    def forward(self, pitch_class, octave, log_duration,
+                beat_sin, beat_cos, velocity, voice):
         pc_angle = pitch_class.float() * (2.0 * math.pi / 12.0)
-        pc_sin   = torch.sin(pc_angle)         # circular pitch class
-        pc_cos   = torch.cos(pc_angle)
-
         fixed = torch.stack([
-            pc_sin,
-            pc_cos,
-            octave.float(),
-            log_duration.float(),
-            beat_sin.float(),
-            beat_cos.float(),
+            torch.sin(pc_angle), torch.cos(pc_angle),
+            octave.float(), log_duration.float(),
+            beat_sin.float(), beat_cos.float(),
             velocity.float(),
-        ], dim=-1)                             # (B, T, 7)
-
-        v_emb = self.voice_embed(voice.long())  # (B, T, 16)
-        return torch.cat([fixed, v_emb], dim=-1)  # (B, T, 23)
+        ], dim=-1)
+        v_emb = self.voice_embed(voice.long())
+        return torch.cat([fixed, v_emb], dim=-1)
 
 
 # ── Field Machine ──────────────────────────────────────────────────────────────
 
-SEED_DIM = 256
-
 class FM(nn.Module):
-    """
-    Field Machine.
-
-    Training forward (fully parallel, no loops, no approximation):
-      DNA → project → * pos_encoding → cumsum → decode → logits
-
-    Inference (O(1) per token):
-      field_t = field_{t-1} + project(dna(token_t)) * pos_vec[t]
-      decode(field_t) → next token logits
-    """
-
     def __init__(self,
-                 vocab_size:          int,
-                 dim:                 int   = DIM,
-                 dna_dim:             int   = DNA_DIM,
-                 n_voices:            int   = N_VOICES,
-                 voice_dim:           int   = VOICE_DIM,
-                 pos_base:            float = POS_BASE,
-                 n_decoder_layers:    int   = N_DECODER_LAYERS,
-                 decoder_hidden:      int   = DECODER_HIDDEN,
-                 dropout:             float = 0.1,
-                 seed_dim:            int   = SEED_DIM):
+                 vocab_size:       int,
+                 dim:              int   = DIM,
+                 dna_dim:          int   = DNA_DIM,
+                 n_voices:         int   = N_VOICES,
+                 voice_dim:        int   = VOICE_DIM,
+                 pos_base:         float = POS_BASE,
+                 n_decoder_layers: int   = N_DECODER_LAYERS,
+                 decoder_hidden:   int   = DECODER_HIDDEN,
+                 dropout:          float = 0.1,
+                 seed_dim:         int   = SEED_DIM):
         super().__init__()
 
         self.vocab_size       = vocab_size
@@ -167,51 +99,41 @@ class FM(nn.Module):
         self.pos_base         = pos_base
         self.dna_dim          = dna_dim
         self.n_decoder_layers = n_decoder_layers
+        self.seed_dim         = seed_dim
 
         # DNA encoder
         self.dna  = NoteDNA(n_voices, voice_dim)
 
-        # DNA → field projection + normalization
+        # DNA → field projection
         self.proj = nn.Sequential(
             nn.Linear(dna_dim, dim),
             nn.LayerNorm(dim),
         )
 
-        # Field → logits decoder (3 hidden layers, GELU)
-        dec_layers = []
+        # Field → logits decoder (per-layer seed gating)
+        # Each decoder layer has its own seed projection for independent gating
+        self.dec_linears = nn.ModuleList()
+        self.dec_seed_projs = nn.ModuleList()
         in_dim = dim
         for i in range(n_decoder_layers):
             is_last = (i == n_decoder_layers - 1)
             out_dim = vocab_size if is_last else decoder_hidden
-            dec_layers.append(nn.Linear(in_dim, out_dim))
-            if not is_last:
-                dec_layers.append(nn.GELU())
-                dec_layers.append(nn.Dropout(dropout))
+            self.dec_linears.append(nn.Linear(in_dim, out_dim))
+            # Per-layer seed projects to same dim as layer output
+            self.dec_seed_projs.append(nn.Linear(seed_dim, out_dim))
             in_dim = decoder_hidden
-        self.decoder = nn.Sequential(*dec_layers)
 
-        self.dropout  = nn.Dropout(dropout)
-        self.seed_dim  = seed_dim
+        self.dec_gelu    = nn.GELU()
+        self.dec_dropout = nn.Dropout(dropout)
+        self.dropout     = nn.Dropout(dropout)
 
-        # Seed conditioning: 256-dim latent → 4096-dim field bias
-        # Added to every token's contribution before cumsum.
-        # Trained with random seed per sequence + occasional token dropout
-        # to ensure seed is load-bearing, not ignored.
-        # Seed projects to 4096-dim gain mask via sigmoid.
-        # gain[i] ∈ (0,1) — selectively amplifies/attenuates field dimensions.
-        # Multiplicative: seed shapes the entire trajectory, not a one-time additive impulse.
-        self.seed_proj = nn.Sequential(
-            nn.Linear(seed_dim, dim),
-            nn.Sigmoid(),
-        )
+        # Field-level seed gain — gates field accumulation per dimension
+        self.seed_proj = nn.Linear(seed_dim, dim)
 
-        # Position encoding cache — built on first forward, reused
         self._pe_cache        = None
         self._pe_cache_len    = 0
         self._pe_cache_device = None
-
-        # Vocabulary → DNA fields map, populated by tokenizer for generation
-        self.idx_to_fields = None
+        self.idx_to_fields    = None
 
         self._init_weights()
 
@@ -222,17 +144,42 @@ class FM(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _pos(self, seq_len: int, device, dtype) -> torch.Tensor:
-        """Return position encoding (seq_len, dim), building/extending cache as needed."""
-        if (self._pe_cache is None or
-                seq_len > self._pe_cache_len or
+    def _pos(self, seq_len, device, dtype):
+        if (self._pe_cache is None or seq_len > self._pe_cache_len or
                 self._pe_cache.device != device):
             build_len = max(seq_len, 1024)
-            self._pe_cache        = build_pos_encoding(
-                build_len, self.dim, self.pos_base, device, dtype)
+            self._pe_cache        = build_pos_encoding(build_len, self.dim, self.pos_base, device, dtype)
             self._pe_cache_len    = build_len
             self._pe_cache_device = device
         return self._pe_cache[:seq_len].to(dtype)
+
+    def _seed_gain(self, seed, dtype):
+        """Compute field-level gain mask from seed. (B, dim) ∈ (0,1)"""
+        return torch.sigmoid(self.seed_proj(seed.to(dtype)) * SEED_SIGMOID_SCALE)
+
+    def _decode_with_seed(self, field_flat, seed_flat, dtype):
+        """
+        Decoder with per-layer seed gating.
+        field_flat: (N, dim)
+        seed_flat:  (N, seed_dim)
+        Returns: (N, vocab_size)
+        """
+        x = field_flat
+        for i, linear in enumerate(self.dec_linears):
+            is_last = (i == self.n_decoder_layers - 1)
+            h = linear(x)
+            # Per-layer seed gate: sigmoid(seed_proj(seed)) multiplied into layer output
+            layer_gain = torch.sigmoid(
+                self.dec_seed_projs[i](seed_flat.to(dtype)) * SEED_SIGMOID_SCALE
+            )
+            h = h * layer_gain
+            if not is_last:
+                h = self.dec_gelu(h)
+                h = self.dec_dropout(h)
+                x = h
+            else:
+                x = h
+        return x
 
     # ── Training forward ───────────────────────────────────────────────────────
 
@@ -245,49 +192,48 @@ class FM(nn.Module):
                 velocity:     torch.Tensor,
                 voice:        torch.Tensor,
                 seed:         torch.Tensor = None,
-                token_dropout_p: float     = 0.15,
+                return_field: bool         = False,
                 ) -> torch.Tensor:
         """
         All inputs: (B, T)
-        seed: (B, seed_dim) — optional latent seed vector.
-              If None, sampled randomly during training (injected by train loop).
-        token_dropout_p: probability of zeroing token contributions entirely,
-              forcing model to reconstruct from seed alone (prevents posterior collapse).
-        Returns: (B, T, vocab_size)
+        seed: (B, seed_dim)
+        return_field: if True returns (logits, field_final) for contrastive loss
+        Returns: (B, T, vocab_size) or ((B, T, vocab_size), (B, dim))
         """
         B, T   = pitch_class.shape
         device = pitch_class.device
         dtype  = next(self.parameters()).dtype
 
-        # 1. DNA: (B, T, 23)
-        dna = self.dropout(
-            self.dna(pitch_class, octave, log_duration,
-                     beat_sin, beat_cos, velocity, voice)
-        )
+        # DNA → project
+        dna       = self.dropout(self.dna(pitch_class, octave, log_duration,
+                                          beat_sin, beat_cos, velocity, voice))
+        projected = self.proj(dna)                        # (B, T, dim)
 
-        # 2. Project to field dim: (B, T, 4096)
-        projected = self.proj(dna)
-
-        # Token dropout disabled — causes gradient vanishing with bfloat16
-        # Random seed per sequence is sufficient to prevent posterior collapse
-
-        # 4. Position encoding: (B, T, 4096)
+        # Position encoding
         pe        = self._pos(T, device, projected.dtype)
-        modulated = projected * pe.unsqueeze(0)
+        modulated = projected * pe.unsqueeze(0)           # (B, T, dim)
 
-        # 5. Seed conditioning — add seed projection to every token's contribution
-        #    seed: (B, seed_dim) → (B, 1, 4096), broadcast across all T positions
+        # Field-level seed gain — gates entire field accumulation
         if seed is not None:
-            seed_gain  = self.seed_proj(seed.to(dtype))       # (B, 4096) ∈ (0,1)
-            modulated  = modulated * seed_gain.unsqueeze(1)   # (B, T, 4096) — multiplicative
+            gain      = self._seed_gain(seed, dtype)      # (B, dim)
+            modulated = modulated * gain.unsqueeze(1)      # (B, T, dim)
 
-        # 6. Cumulative field — one CUDA op: (B, T, 4096)
-        field = torch.cumsum(modulated, dim=1)
+        # Cumulative field
+        field = torch.cumsum(modulated, dim=1)            # (B, T, dim)
 
-        # 7. Decode all positions in one batched pass: (B, T, vocab)
-        logits = self.decoder(
-            field.reshape(B * T, self.dim)
-        ).reshape(B, T, self.vocab_size)
+        # Per-layer seed decoder
+        field_flat = field.reshape(B * T, self.dim)
+        if seed is not None:
+            seed_flat = seed.to(dtype).unsqueeze(1).expand(-1, T, -1).reshape(B * T, self.seed_dim)
+        else:
+            seed_flat = torch.zeros(B * T, self.seed_dim, device=device, dtype=dtype)
+
+        logits = self._decode_with_seed(field_flat, seed_flat, dtype).reshape(B, T, self.vocab_size)
+
+        if return_field:
+            # Return final field state (last position) for contrastive loss
+            field_final = field[:, -1, :]                 # (B, dim)
+            return logits, field_final
 
         return logits
 
@@ -300,24 +246,21 @@ class FM(nn.Module):
                  temperature:    float = 1.0,
                  top_k:          int   = 50,
                  top_p:          float = 0.95,
-                 seed_strength:  float = 1.0,
-                 seed:           int   = None) -> list:
+                 seed:           int   = None,
+                 seed_vec:       torch.Tensor = None,
+                 seed_b:         int   = None,
+                 alpha:          float = None) -> list:
         """
-        O(1) per token inference via running field accumulation.
-
-        prompt_fields: dict of {field_name: (1, T) tensor}
-        seed_strength: scale of the seed vector (1.0 = full strength).
-                       The seed is a learned compositional identity — not noise.
-                       0.0 = no seed (deterministic attractor).
-        seed: integer for reproducibility. None = random each run.
-        Returns: list of generated vocab indices.
+        O(1) inference.
+        seed: integer → reproducible generation
+        seed_vec: raw tensor seed (overrides seed integer)
+        seed_b + alpha: interpolate between seed and seed_b (lerp in seed space)
         """
         self.eval()
         device = next(self.parameters()).device
         dtype  = next(self.parameters()).dtype
 
-        def _to(x):
-            return x.to(device)
+        def _to(x): return x.to(device)
 
         pc  = _to(prompt_fields['pitch_class'])
         oc  = _to(prompt_fields['octave'])
@@ -330,75 +273,79 @@ class FM(nn.Module):
         T_prompt = pc.shape[1]
         pe       = self._pos(T_prompt + max_new_tokens, device, dtype)
 
-        # Sample seed vector
-        rng = torch.Generator(device=device)
-        if seed is not None:
-            rng.manual_seed(seed)
-        seed_vec  = torch.randn(1, self.seed_dim, generator=rng, device=device, dtype=dtype)
-        seed_gain = self.seed_proj(seed_vec).squeeze(0)  # (4096,) ∈ (0,1)
+        # Build seed vector
+        if seed_vec is not None:
+            sv = seed_vec.to(device=device, dtype=dtype)
+        else:
+            rng = torch.Generator(device=device)
+            if seed is not None:
+                rng.manual_seed(seed)
+            sv = torch.randn(1, self.seed_dim, generator=rng, device=device, dtype=dtype)
 
-        # Build initial field from prompt, with seed bias on every token
-        dna       = self.dna(pc, oc, dur, bs, bc, vel, voi)       # (1, T, 23)
-        projected = self.proj(dna)                                  # (1, T, 4096)
-        modulated = projected * pe[:T_prompt].unsqueeze(0)          # (1, T, 4096)
-        modulated = modulated * seed_gain.unsqueeze(0).unsqueeze(0)  # multiply seed gain into every position
-        field     = modulated.sum(dim=1).squeeze(0)                 # (4096,) running sum
+        # Seed interpolation
+        if seed_b is not None and alpha is not None:
+            rng2 = torch.Generator(device=device)
+            rng2.manual_seed(seed_b)
+            sv2 = torch.randn(1, self.seed_dim, generator=rng2, device=device, dtype=dtype)
+            sv  = alpha * sv + (1.0 - alpha) * sv2
+
+        gain       = self._seed_gain(sv, dtype).squeeze(0)        # (dim,)
+        seed_flat1 = sv.to(dtype)                                  # (1, seed_dim)
+
+        # Build initial field
+        dna       = self.dna(pc, oc, dur, bs, bc, vel, voi)
+        projected = self.proj(dna)
+        modulated = projected * pe[:T_prompt].unsqueeze(0) * gain.unsqueeze(0).unsqueeze(0)
+        field     = modulated.sum(dim=1).squeeze(0)                # (dim,)
 
         generated = []
         t = T_prompt
 
-        for step in range(max_new_tokens):
-            # Decode current field state
-            logits = self.decoder(field.unsqueeze(0)) / max(temperature, 1e-8)  # (1, vocab)
+        for _ in range(max_new_tokens):
+            logits = self._decode_with_seed(
+                field.unsqueeze(0), seed_flat1, dtype
+            ).squeeze(0) / max(temperature, 1e-8)
 
-            # Top-k
             if top_k > 0:
                 kk = min(top_k, logits.shape[-1])
                 top_vals, _ = torch.topk(logits, kk)
-                logits[logits < top_vals[:, -1:]] = float('-inf')
+                logits[logits < top_vals[-1]] = float('-inf')
 
-            # Top-p (nucleus)
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
                 cum_probs   = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
                 remove_mask = cum_probs > top_p
-                remove_mask[..., 1:] = remove_mask[..., :-1].clone()
-                remove_mask[..., 0]  = False
+                remove_mask[1:] = remove_mask[:-1].clone()
+                remove_mask[0]  = False
                 sorted_logits[remove_mask] = float('-inf')
-                logits = torch.zeros_like(logits).scatter_(1, sorted_idx, sorted_logits)
+                logits = torch.zeros_like(logits).scatter_(0, sorted_idx, sorted_logits)
 
             probs      = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
             generated.append(next_token)
 
-            # O(1) field update
             token_fields = self._token_to_fields(next_token, device, dtype)
             if token_fields is None:
                 break
 
-            dna_vec  = self.dna(**token_fields).squeeze(0).squeeze(0)  # (23,)
-            proj_vec = self.proj(dna_vec.unsqueeze(0).unsqueeze(0)
-                                 ).squeeze(0).squeeze(0)                # (4096,)
-            field    = field + proj_vec * pe[t] * seed_gain             # O(1) × seed gain
+            dna_vec  = self.dna(**token_fields).squeeze(0).squeeze(0)
+            proj_vec = self.proj(dna_vec.unsqueeze(0).unsqueeze(0)).squeeze(0).squeeze(0)
+            field    = field + proj_vec * pe[t] * gain
             t       += 1
 
         return generated
 
-    def _token_to_fields(self, token_idx: int, device, dtype):
-        """Convert vocab index to DNA field tensors for generation. Returns None on EOS/unknown."""
-        if self.idx_to_fields is None:
-            return None
-        if token_idx < 0 or token_idx >= len(self.idx_to_fields):
-            return None
+    def _token_to_fields(self, token_idx, device, dtype):
+        if self.idx_to_fields is None: return None
+        if token_idx < 0 or token_idx >= len(self.idx_to_fields): return None
         fields = self.idx_to_fields[token_idx]
-        if fields is None:
-            return None
+        if fields is None: return None
         return {k: torch.tensor([[v]], device=device) for k, v in fields.items()}
 
-    def count_parameters(self) -> int:
+    def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def extra_repr(self) -> str:
+    def extra_repr(self):
         return (f"dim={self.dim}, dna_dim={self.dna_dim}, "
                 f"vocab={self.vocab_size}, pos_base={self.pos_base}, "
                 f"params={self.count_parameters():,}")
