@@ -86,29 +86,45 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 ## Training Results
 
 **Hardware:** RTX 5060 Ti (16GB VRAM)  
-**Dataset:** 201 Bach MIDI files, 532 vocab tokens, sequences 120–24,203 notes  
+**Dataset:** 201 Bach MIDI files, sequences 120–24,203 notes  
 **Parameters:** 13.78M  
-**VRAM:** 0.64GB allocated, 7.5GB reserved (PyTorch allocator) FM appears to actively train in well under 1 GB of tensor allocation, while PyTorch reserves several GB during execution.
+**VRAM:** up to 1.12GB allocated (PyTorch reserves several GB)  
 **Batch size:** 1 (full files, no padding, no windowing)
+
+### Run 1 — original vocab (pitch × duration, 532 tokens, 100 epochs)
 
 | Epoch | Avg. Loss | Note |
 |---|---|---|
 | 1 | 62.45 | First pass (LR warmup) |
 | 2 | 5.48 | Below random baseline (log(532) ≈ 6.28) |
-| 5 | 5.05 | Stable descent |
+| 5 | 5.05 | |
 | 10 | 4.87 | |
 | 25 | 4.50 | |
 | 50 | 3.82 | |
 | 75 | 3.27 | |
-| **100** | **3.09** | **Final — 4 min 43 sec total** |
+| **100** | **3.09** | **4 min 43 sec total** |
 
-**Random baseline** for 532 tokens: log(532) ≈ 6.28. The model is below random baseline by epoch 2.
+### Run 2 — REST tokens + beat_bin vocab (200 epochs)
 
-**Total training time for 100 epochs: 4 minutes 43 seconds.**
+Vocab key changed to `(event_type, pitch, snapped_duration, beat_bin)`. REST tokens added. Beat position included in vocab identity at 16-bin resolution.
 
-For comparison: the GSM architecture trained on the same corpus required 45 minutes for 100 epochs with 32M parameters. FM trains in one ninth the time with 13.78M parameters.
+| Epoch | Avg. Loss | Note |
+|---|---|---|
+| 1 | 71.34 | First pass (LR warmup) |
+| 2 | 8.62 | |
+| 5 | 7.33 | |
+| 10 | 6.99 | |
+| 25 | 6.29 | Below random baseline (larger vocab) |
+| 50 | 5.10 | |
+| 75 | 4.14 | |
+| 100 | 3.49 | |
+| 125 | 3.04 | |
+| 150 | 2.81 | |
+| 175 | 2.70 | |
+| **200** | **2.63** | **15 min 6 sec total — best: 0.05 at epoch 165** |
 
-**Throughput:** ~74 it/s, 100k–900k tok/s depending on file length, 0.64GB allocated VRAM.
+**Total tokens processed:** 74.74M  
+**Throughput:** ~53 it/s, up to 1.7M tok/s depending on file length
 
 ---
 
