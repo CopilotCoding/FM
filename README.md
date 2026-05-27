@@ -1,4 +1,4 @@
-WIP tokenizer doesn't scale to large datasets yet, working on it.
+WIP tokenizer doesn't scale to large datasets yet, working on it. Also forgot to add randomization to the outputs, so it produced the exact same song every time lmao.
 
 # FM — Field Machine
 
