@@ -1,9 +1,3 @@
-# TO DO:
-
-Add a REST token to the vocab and let sequences include silence
-Make cur_tick advance by the actual predicted duration instead of a fixed 16th note
-Include beat position in the vocab key so the model learns temporal placement
-
 # FM — Field Machine
 
 A new sequence architecture invented May 26, 2026. Not a transformer. Not an RNN. Not an SSM.
