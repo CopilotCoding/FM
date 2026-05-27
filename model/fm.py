@@ -197,9 +197,12 @@ class FM(nn.Module):
         # Added to every token's contribution before cumsum.
         # Trained with random seed per sequence + occasional token dropout
         # to ensure seed is load-bearing, not ignored.
+        # Seed projects to 4096-dim gain mask via sigmoid.
+        # gain[i] ∈ (0,1) — selectively amplifies/attenuates field dimensions.
+        # Multiplicative: seed shapes the entire trajectory, not a one-time additive impulse.
         self.seed_proj = nn.Sequential(
             nn.Linear(seed_dim, dim),
-            nn.LayerNorm(dim),
+            nn.Sigmoid(),
         )
 
         # Position encoding cache — built on first forward, reused
@@ -275,8 +278,8 @@ class FM(nn.Module):
         # 5. Seed conditioning — add seed projection to every token's contribution
         #    seed: (B, seed_dim) → (B, 1, 4096), broadcast across all T positions
         if seed is not None:
-            seed_bias  = self.seed_proj(seed.to(dtype))       # (B, 4096)
-            modulated  = modulated + seed_bias.unsqueeze(1)   # (B, T, 4096)
+            seed_gain  = self.seed_proj(seed.to(dtype))       # (B, 4096) ∈ (0,1)
+            modulated  = modulated * seed_gain.unsqueeze(1)   # (B, T, 4096) — multiplicative
 
         # 6. Cumulative field — one CUDA op: (B, T, 4096)
         field = torch.cumsum(modulated, dim=1)
@@ -332,13 +335,13 @@ class FM(nn.Module):
         if seed is not None:
             rng.manual_seed(seed)
         seed_vec  = torch.randn(1, self.seed_dim, generator=rng, device=device, dtype=dtype)
-        seed_bias = self.seed_proj(seed_vec).squeeze(0) * seed_strength  # (4096,)
+        seed_gain = self.seed_proj(seed_vec).squeeze(0)  # (4096,) ∈ (0,1)
 
         # Build initial field from prompt, with seed bias on every token
         dna       = self.dna(pc, oc, dur, bs, bc, vel, voi)       # (1, T, 23)
         projected = self.proj(dna)                                  # (1, T, 4096)
         modulated = projected * pe[:T_prompt].unsqueeze(0)          # (1, T, 4096)
-        modulated = modulated + seed_bias.unsqueeze(0).unsqueeze(0) # add seed to every position
+        modulated = modulated * seed_gain.unsqueeze(0).unsqueeze(0)  # multiply seed gain into every position
         field     = modulated.sum(dim=1).squeeze(0)                 # (4096,) running sum
 
         generated = []
@@ -376,7 +379,7 @@ class FM(nn.Module):
             dna_vec  = self.dna(**token_fields).squeeze(0).squeeze(0)  # (23,)
             proj_vec = self.proj(dna_vec.unsqueeze(0).unsqueeze(0)
                                  ).squeeze(0).squeeze(0)                # (4096,)
-            field    = field + proj_vec * pe[t] + seed_bias             # O(1) + seed
+            field    = field + proj_vec * pe[t] * seed_gain             # O(1) × seed gain
             t       += 1
 
         return generated
