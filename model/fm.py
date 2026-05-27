@@ -270,11 +270,18 @@ class FM(nn.Module):
                  max_new_tokens: int   = 512,
                  temperature:    float = 1.0,
                  top_k:          int   = 50,
-                 top_p:          float = 0.95) -> list:
+                 top_p:          float = 0.95,
+                 seed_strength:  float = 0.0,
+                 seed:           int   = None) -> list:
         """
         O(1) per token inference via running field accumulation.
 
         prompt_fields: dict of {field_name: (1, T) tensor}
+        seed_strength: magnitude of random offset injected into the initial field.
+                       0.0 = deterministic (same output every time).
+                       0.05–0.15 = varied output, different trajectory each run.
+                       Controls P(next | history, seed) instead of P(next | history).
+        seed: random seed for reproducibility. None = random each run.
         Returns: list of generated vocab indices.
 
         State = one 4096-dim vector. Never grows. Memory is constant forever.
@@ -302,6 +309,14 @@ class FM(nn.Module):
         projected = self.proj(dna)                              # (1, T, 4096)
         modulated = projected * pe[:T_prompt].unsqueeze(0)      # (1, T, 4096)
         field     = modulated.sum(dim=1).squeeze(0)             # (4096,) running sum
+
+        # Seed vector — inject controlled randomness into field before generation
+        if seed_strength > 0.0:
+            rng = torch.Generator(device=device)
+            if seed is not None:
+                rng.manual_seed(seed)
+            seed_vec = torch.randn(self.dim, generator=rng, device=device, dtype=dtype)
+            field = field + seed_vec * seed_strength
 
         generated = []
         t = T_prompt

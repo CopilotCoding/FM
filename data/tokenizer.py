@@ -218,6 +218,274 @@ def extract_rests(notes: list, tpb: int) -> list:
     return result
 
 
+def _single_pass_chunk(paths: list) -> tuple:
+    """
+    Single pass: build vocab keys AND tokenize sequences simultaneously.
+    Returns (key_fields dict, sequences list) for this chunk.
+    """
+    import numpy as np
+    key_fields = {}
+    sequences  = []
+
+    for path in paths:
+        try:
+            tpb, notes = parse_midi(path)
+        except Exception:
+            continue
+        if not notes:
+            continue
+
+        notes_arr = np.array(notes, dtype=np.int64)
+        abs_ticks  = notes_arr[:, 0]
+        pitches    = notes_arr[:, 1]
+        vels       = notes_arr[:, 2]
+        dur_ticks  = notes_arr[:, 3]
+        channels   = notes_arr[:, 4]
+
+        dur_beats    = dur_ticks / tpb
+        dur_arr      = np.array(MUSICAL_DURS)
+        snapped_idx  = np.argmin(np.abs(dur_beats[:, None] - dur_arr[None, :]), axis=1)
+        snapped_durs = dur_arr[snapped_idx]
+
+        log_durs = np.log2(snapped_durs + 1e-4)
+        log_durs = np.clip((log_durs - (-2.0)) / (2.0 - (-2.0)) * 2.0 - 1.0, -1.0, 1.0)
+
+        ticks_per_bar = tpb * 4
+        tick_in_bar   = abs_ticks % ticks_per_bar
+        bin_size      = ticks_per_bar / N_BEAT_BINS
+        beat_bins     = (tick_in_bar / bin_size).astype(np.int64) % N_BEAT_BINS
+        angles        = 2.0 * np.pi * beat_bins / N_BEAT_BINS
+        beat_sins     = np.sin(angles)
+        beat_coss     = np.cos(angles)
+
+        pitch_classes = pitches % 12
+        octaves       = np.clip(pitches // 12, 0, 8) / 8.0
+        velocities    = np.clip(vels, 0, 127) / 127.0
+        voices        = np.clip(channels, 0, 15)
+
+        out_pc, out_oct, out_ld, out_bs, out_bc = [], [], [], [], []
+        out_vel, out_voice, out_keys = [], [], []
+
+        for i in range(len(notes)):
+            nkey = ('note', int(pitches[i]), float(snapped_durs[i]), int(beat_bins[i]))
+            if nkey not in key_fields:
+                key_fields[nkey] = {
+                    'pitch_class':  int(pitch_classes[i]),
+                    'octave':       float(octaves[i]),
+                    'log_duration': float(log_durs[i]),
+                    'beat_sin':     float(beat_sins[i]),
+                    'beat_cos':     float(beat_coss[i]),
+                    'velocity':     float(velocities[i]),
+                    'voice':        int(voices[i]),
+                }
+            out_pc.append(int(pitch_classes[i]))
+            out_oct.append(float(octaves[i]))
+            out_ld.append(float(log_durs[i]))
+            out_bs.append(float(beat_sins[i]))
+            out_bc.append(float(beat_coss[i]))
+            out_vel.append(float(velocities[i]))
+            out_voice.append(int(voices[i]))
+            out_keys.append(nkey)
+
+            # Rest between notes
+            if i + 1 < len(notes):
+                gap = int(notes[i+1][0]) - int(notes[i][0])
+                if gap > tpb / 4:
+                    gb = gap / tpb
+                    gs = min(MUSICAL_DURS, key=lambda x: abs(x - gb))
+                    gl = float(np.clip((np.log2(gs + 1e-4) - (-2.0)) / (2.0 - (-2.0)) * 2.0 - 1.0, -1.0, 1.0))
+                    rt = int(notes[i][0]) + int(notes[i][3])
+                    rb = int((rt % ticks_per_bar) / bin_size) % N_BEAT_BINS
+                    ra = 2.0 * np.pi * rb / N_BEAT_BINS
+                    rbs, rbc = float(np.sin(ra)), float(np.cos(ra))
+                    rkey = ('rest', None, gs, rb)
+                    if rkey not in key_fields:
+                        key_fields[rkey] = {
+                            'pitch_class':  0,
+                            'octave':       0.0,
+                            'log_duration': gl,
+                            'beat_sin':     rbs,
+                            'beat_cos':     rbc,
+                            'velocity':     0.0,
+                            'voice':        0,
+                        }
+                    out_pc.append(0); out_oct.append(0.0); out_ld.append(gl)
+                    out_bs.append(rbs); out_bc.append(rbc)
+                    out_vel.append(0.0); out_voice.append(0)
+                    out_keys.append(rkey)
+
+        if out_keys:
+            sequences.append({
+                'pitch_class':  out_pc,
+                'octave':       out_oct,
+                'log_duration': out_ld,
+                'beat_sin':     out_bs,
+                'beat_cos':     out_bc,
+                'velocity':     out_vel,
+                'voice':        out_voice,
+                'keys':         out_keys,   # resolved to indices after vocab is built
+            })
+
+    return key_fields, sequences
+    """Parse a chunk of MIDI files, return combined key->fields dict."""
+    result = {}
+    for path in paths:
+        try:
+            tpb, notes = parse_midi(path)
+            events = extract_rests(notes, tpb)
+            for ev in events:
+                if ev['type'] == 'note':
+                    t = note_to_token(ev['pitch'], ev['vel'],
+                                      ev['dur_ticks'], ev['ch'],
+                                      ev['abs_tick'], tpb)
+                else:
+                    t = rest_to_token(ev['dur_beats'], ev['abs_tick'], tpb)
+                k = t['key']
+                if k not in result:
+                    result[k] = t['fields']
+        except Exception:
+            pass
+    return result
+
+
+def _tokenize_file_chunk(args) -> list:
+    """Tokenize a chunk of files. Returns list of (result_or_None) per file."""
+    paths, key_to_idx, pad_idx = args
+    out = []
+    for path in paths:
+        try:
+            tpb, notes = parse_midi(path)
+            events = extract_rests(notes, tpb)
+            seq = {k: [] for k in [
+                'pitch_class', 'octave', 'log_duration',
+                'beat_sin', 'beat_cos', 'velocity', 'voice', 'token_idx'
+            ]}
+            for ev in events:
+                if ev['type'] == 'note':
+                    t = note_to_token(ev['pitch'], ev['vel'],
+                                      ev['dur_ticks'], ev['ch'],
+                                      ev['abs_tick'], tpb)
+                else:
+                    t = rest_to_token(ev['dur_beats'], ev['abs_tick'], tpb)
+                idx = key_to_idx.get(t['key'], pad_idx)
+                f   = t['fields']
+                seq['pitch_class'].append(f['pitch_class'])
+                seq['octave'].append(f['octave'])
+                seq['log_duration'].append(f['log_duration'])
+                seq['beat_sin'].append(f['beat_sin'])
+                seq['beat_cos'].append(f['beat_cos'])
+                seq['velocity'].append(f['velocity'])
+                seq['voice'].append(f['voice'])
+                seq['token_idx'].append(idx)
+            out.append(seq if seq['token_idx'] else None)
+        except Exception:
+            out.append(None)
+    return out
+
+
+# keep old names as aliases so existing imports don't break
+def tokenize_file_vectorized(path: str, key_to_idx: dict, pad_idx: int) -> Optional[Dict[str, list]]:
+    """
+    Vectorized tokenization — processes all notes as numpy arrays.
+    5-10x faster than per-note Python loops.
+    """
+    import numpy as np
+    try:
+        tpb, notes = parse_midi(path)
+    except Exception:
+        return None
+    if not notes:
+        return None
+
+    notes_arr = np.array(notes, dtype=np.int64)  # (N, 5): abs_tick, pitch, vel, dur_ticks, ch
+    abs_ticks  = notes_arr[:, 0]
+    pitches    = notes_arr[:, 1]
+    vels       = notes_arr[:, 2]
+    dur_ticks  = notes_arr[:, 3]
+    channels   = notes_arr[:, 4]
+
+    # Duration in beats → snap to nearest MUSICAL_DUR
+    dur_beats = dur_ticks / tpb
+    dur_arr   = np.array(MUSICAL_DURS)
+    # argmin of abs difference for each note
+    snapped_idx  = np.argmin(np.abs(dur_beats[:, None] - dur_arr[None, :]), axis=1)
+    snapped_durs = dur_arr[snapped_idx]
+
+    # Log duration normalized
+    log_durs = np.log2(snapped_durs + 1e-4)
+    log_durs = (log_durs - (-2.0)) / (2.0 - (-2.0)) * 2.0 - 1.0
+    log_durs = np.clip(log_durs, -1.0, 1.0)
+
+    # Beat bins
+    ticks_per_bar = tpb * 4
+    tick_in_bar   = abs_ticks % ticks_per_bar
+    bin_size      = ticks_per_bar / N_BEAT_BINS
+    beat_bins     = (tick_in_bar / bin_size).astype(np.int64) % N_BEAT_BINS
+    angles        = 2.0 * np.pi * beat_bins / N_BEAT_BINS
+    beat_sins     = np.sin(angles)
+    beat_coss     = np.cos(angles)
+
+    # Pitch fields
+    pitch_classes = pitches % 12
+    octaves       = np.clip(pitches // 12, 0, 8) / 8.0
+    velocities    = np.clip(vels, 0, 127) / 127.0
+    voices        = np.clip(channels, 0, 15)
+
+    # Build token indices
+    token_indices = []
+    for i in range(len(notes)):
+        key = ('note', int(pitches[i]), float(snapped_durs[i]), int(beat_bins[i]))
+        token_indices.append(key_to_idx.get(key, pad_idx))
+
+    # Insert rests between notes where gap > 16th note
+    min_gap = tpb / 4
+    out_pc, out_oct, out_ld, out_bs, out_bc, out_vel, out_voice, out_idx = [], [], [], [], [], [], [], []
+
+    for i in range(len(notes)):
+        out_pc.append(int(pitch_classes[i]))
+        out_oct.append(float(octaves[i]))
+        out_ld.append(float(log_durs[i]))
+        out_bs.append(float(beat_sins[i]))
+        out_bc.append(float(beat_coss[i]))
+        out_vel.append(float(velocities[i]))
+        out_voice.append(int(voices[i]))
+        out_idx.append(token_indices[i])
+
+        if i + 1 < len(notes):
+            gap = notes[i+1][0] - notes[i][0]
+            if gap > min_gap:
+                gap_beats   = gap / tpb
+                gap_snapped = min(MUSICAL_DURS, key=lambda x: abs(x - gap_beats))
+                gap_log     = float(np.clip((np.log2(gap_snapped + 1e-4) - (-2.0)) / (2.0 - (-2.0)) * 2.0 - 1.0, -1.0, 1.0))
+                rest_tick   = notes[i][0] + notes[i][3]
+                rb          = int((rest_tick % ticks_per_bar) / bin_size) % N_BEAT_BINS
+                rbs, rbc    = float(np.sin(2 * np.pi * rb / N_BEAT_BINS)), float(np.cos(2 * np.pi * rb / N_BEAT_BINS))
+                rkey        = ('rest', None, gap_snapped, rb)
+                out_pc.append(0); out_oct.append(0.0); out_ld.append(gap_log)
+                out_bs.append(rbs); out_bc.append(rbc)
+                out_vel.append(0.0); out_voice.append(0)
+                out_idx.append(key_to_idx.get(rkey, pad_idx))
+
+    if not out_idx:
+        return None
+
+    return {
+        'pitch_class':  out_pc,
+        'octave':       out_oct,
+        'log_duration': out_ld,
+        'beat_sin':     out_bs,
+        'beat_cos':     out_bc,
+        'velocity':     out_vel,
+        'voice':        out_voice,
+        'token_idx':    out_idx,
+    }
+
+def _tokenize_one_file(args):
+    path, key_to_idx, pad_idx = args
+    results = _tokenize_file_chunk(([path], key_to_idx, pad_idx))
+    return results[0] if results else None
+
+
 # ── Tokenizer ──────────────────────────────────────────────────────────────────
 
 class FMTokenizer:
@@ -242,6 +510,85 @@ class FMTokenizer:
     @property
     def vocab_size(self) -> int:
         return len(self.idx_to_fields)
+
+    def _build_with_progress_parallel(self, midi_dir: str, files: list,
+                                       progress, task, workers: int = 16) -> 'FMTokenizer':
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        seen_keys = set()
+        key_fields: Dict[tuple, dict] = {}
+
+        def parse_one(path):
+            try:
+                tpb, notes = parse_midi(path)
+                events = extract_rests(notes, tpb)
+                result = {}
+                for ev in events:
+                    if ev['type'] == 'note':
+                        t = note_to_token(ev['pitch'], ev['vel'],
+                                          ev['dur_ticks'], ev['ch'],
+                                          ev['abs_tick'], tpb)
+                    else:
+                        t = rest_to_token(ev['dur_beats'], ev['abs_tick'], tpb)
+                    k = t['key']
+                    if k not in result:
+                        result[k] = t['fields']
+                return result
+            except Exception:
+                return {}
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {ex.submit(parse_one, f): f for f in files}
+            for fut in as_completed(futures):
+                r = fut.result()
+                for k, f in r.items():
+                    seen_keys.add(k)
+                    if k not in key_fields:
+                        key_fields[k] = f
+                progress.advance(task)
+
+        self.idx_to_fields = [None, None, None]
+        for key in sorted(seen_keys, key=lambda k: (k[0], k[2] or 0.0, k[1] or 0, k[3])):
+            idx = len(self.idx_to_fields)
+            self.key_to_idx[key] = idx
+            self.idx_to_key[idx] = key
+            self.idx_to_fields.append(key_fields[key])
+        self._built = True
+        return self
+
+    def _build_with_progress(self, midi_dir: str, progress, task) -> 'FMTokenizer':
+        """Build vocabulary with an external Rich progress task."""
+        files = [str(p) for p in Path(midi_dir).rglob('*.mid')]
+        seen_keys = set()
+        key_fields: Dict[tuple, dict] = {}
+        errors = 0
+        for path in files:
+            try:
+                tpb, notes = parse_midi(path)
+                events = extract_rests(notes, tpb)
+                for ev in events:
+                    if ev['type'] == 'note':
+                        t = note_to_token(ev['pitch'], ev['vel'],
+                                          ev['dur_ticks'], ev['ch'],
+                                          ev['abs_tick'], tpb)
+                    else:
+                        t = rest_to_token(ev['dur_beats'], ev['abs_tick'], tpb)
+                    k = t['key']
+                    seen_keys.add(k)
+                    if k not in key_fields:
+                        key_fields[k] = t['fields']
+            except Exception:
+                errors += 1
+            progress.advance(task)
+
+        self.idx_to_fields = [None, None, None]
+        for key in sorted(seen_keys, key=lambda k: (k[0], k[2] or 0.0, k[1] or 0, k[3])):
+            idx = len(self.idx_to_fields)
+            self.key_to_idx[key] = idx
+            self.idx_to_key[idx] = key
+            self.idx_to_fields.append(key_fields[key])
+        self._built = True
+        return self
 
     def build(self, midi_dir: str, verbose: bool = True) -> 'FMTokenizer':
         files = [str(p) for p in Path(midi_dir).rglob('*.mid')]
