@@ -1,7 +1,9 @@
-PROJECT IS A FAILURE TO LEARN FROM:
-STILL HAS SAME SONG PRODUCTION ISSUE, WORKING ON PATCH NOW AS NAIVE SEED APPROACH FAILED, PARTIALLY FIXED
+---
 
 # FM — Field Machine
+
+PROJECT IS A FAILURE TO LEARN FROM:
+STILL HAS SAME SONG PRODUCTION ISSUE, WORKING ON PATCH NOW AS NAIVE SEED APPROACH FAILED, PARTIALLY FIXED
 
 A new sequence architecture invented May 26, 2026. Not a transformer. Not an RNN. Not an SSM.
 
@@ -13,7 +15,7 @@ Every token is a geometrically structured object — its dimensions encoded with
 
 **No loops. No approximation. No serial dependency during training. O(1) inference.**
 
-The parallelization problem that plagues RNNs and SSMs is solved not by approximating the recurrence or writing custom CUDA kernels — but by eliminating the recurrence entirely. The sequence is not a chain of dependent states. It is a set of position-aware contributions to a shared field, all computable simultaneously.
+The parallelization problem that plagues RNNs and SSMs is solved not by approximating recurrence or writing custom CUDA kernels — but by removing recurrence entirely. The sequence is not a chain of dependent states. It is a set of position-aware contributions to a shared field, all computable simultaneously.
 
 ---
 
@@ -23,44 +25,52 @@ The parallelization problem that plagues RNNs and SSMs is solved not by approxim
 note_DNA(23) → Linear(23, 4096) → × pos_encoding(i, base=32768) → cumsum → 3-layer decoder → logits
 ```
 
+---
+
 ### Token DNA (23 dimensions)
 
 Every note is a structured geometric vector — not a flat index into an arbitrary lookup table.
 
-| Field | Encoding | Dims | Geometry |
-|---|---|---|---|
-| Pitch class | sin/cos on unit circle | 2 | Circular — B is one semitone from C, not 11 apart |
-| Octave | linear normalized | 1 | Linear — higher is higher |
-| Duration | log2 normalized | 1 | Logarithmic — 16th vs 8th matters more than half vs whole |
-| Beat position | sin/cos on unit circle | 2 | Circular — beat is periodic within bar |
-| Velocity | linear normalized | 1 | Linear — louder is louder |
-| Voice | learned embedding | 16 | Categorical — soprano ≠ alto |
+| Field         | Encoding               | Dims | Geometry                                                  |
+| ------------- | ---------------------- | ---- | --------------------------------------------------------- |
+| Pitch class   | sin/cos on unit circle | 2    | Circular — B is one semitone from C, not 11 apart         |
+| Octave        | linear normalized      | 1    | Linear — higher is higher                                 |
+| Duration      | log2 normalized        | 1    | Logarithmic — 16th vs 8th matters more than half vs whole |
+| Beat position | sin/cos on unit circle | 2    | Circular — beat is periodic within bar                    |
+| Velocity      | linear normalized      | 1    | Linear — louder is louder                                 |
+| Voice         | learned embedding      | 16   | Categorical — soprano ≠ alto                              |
 
-The geometry is real before training begins. The model does not need to discover from scratch that C and D are adjacent, or that a 16th note and 8th note are related. It starts knowing.
+The geometry is defined before training. The model is not expected to infer these relationships from scratch; it is initialized with them explicitly embedded in representation space.
+
+---
 
 ### Vocabulary
 
 Vocab key: `(event_type, pitch, snapped_duration, beat_bin)` — note tokens plus REST tokens.
 
-- **NOTE** tokens carry full DNA geometry: pitch, octave, duration, beat position, velocity, voice
-- **REST** tokens carry only duration and beat position — pitch/octave/velocity/voice are zeroed. REST is not silence by absence; it is an explicit temporal operator with duration, contributing a pitch-free vector to the field.
+* **NOTE** tokens carry full DNA geometry: pitch, octave, duration, beat position, velocity, voice
+* **REST** tokens carry only duration and beat position — pitch/octave/velocity/voice are zeroed. REST is not absence; it is an explicit temporal operator contributing a pitch-free vector to the field.
 
-Beat position is quantized to 16 bins (16th-note resolution within a 4/4 bar) and included in the vocab key, so the model learns *when* events happen — not just *what* they are.
+Beat position is quantized to 16 bins (16th-note resolution in 4/4), so the model learns when events occur, not only what they are.
 
-Velocity remains a continuous DNA field, not a vocab dimension.
+Velocity remains continuous within the DNA field, not part of the vocabulary.
+
+---
 
 ### Position Encoding
 
-Analytic sinusoidal, base=32768. Maximally orthogonal across positions up to sequence length 32768 — covers 100% of any realistic MIDI corpus including the longest Brandenburg concertos (24,203 notes).
+Analytic sinusoidal encoding, base = 32768. Designed to remain orthogonal up to sequence length 32768, covering all sequences in the corpus (including longest Bach Brandenburg-style pieces at ~24k notes).
 
 ```
 pos[i, 2k]   = sin(i / 32768^(2k/4096))
 pos[i, 2k+1] = cos(i / 32768^(2k/4096))
 ```
 
-Fixed. No parameters. No training. Generalizes to any length. The base was chosen empirically from the actual corpus — not borrowed from transformer conventions.
+No learned parameters. No training required. Deterministic mapping.
 
-Position is **multiplied** into the token vector, not added. Identity and position are fused into one inseparable object before accumulation.
+Position is **multiplied into the token vector**, not added. Identity and position are fused prior to accumulation.
+
+---
 
 ### Field Accumulation
 
@@ -68,11 +78,17 @@ Position is **multiplied** into the token vector, not added. Identity and positi
 field[t] = cumsum(project(dna) * pos_encoding, dim=1)[t]
 ```
 
-One CUDA op. The entire sequence processed in parallel. No loop. No dependency chain. The GPU receives `(batch, seq_len, 4096)` work simultaneously and never waits.
+Single CUDA reduction. Entire sequence processed in parallel. No recurrence, no loop, no sequential dependency during training.
+
+---
 
 ### Decoder
 
-3-layer MLP with GELU activations. Projects from 4096-dimensional field to vocab logits. Must unmix contributions from up to 24,000 overlapping position-modulated token vectors — 3 layers give sufficient nonlinear capacity without becoming a bottleneck.
+3-layer MLP with GELU activations. Projects from 4096-dimensional field to vocabulary logits.
+
+The decoder must disentangle overlapping contributions from thousands of position-modulated token vectors. Depth is intentionally minimal to avoid bottlenecking the representation while still providing nonlinear separation capacity.
+
+---
 
 ### O(1) Inference
 
@@ -80,44 +96,82 @@ One CUDA op. The entire sequence processed in parallel. No loop. No dependency c
 field_t = field_{t-1} + project(dna(token_t)) * pos_vec[t]
 ```
 
-State is one 4096-dimensional vector. Never grows. Constant memory forever. One vector addition per token. No KV cache. No attention over growing context.
+State remains a fixed 4096-dimensional vector. Memory does not grow with sequence length. No KV cache. No attention window.
+
+---
 
 ### Field Seed (generation-time variation)
 
-At generation time, a random vector is added to the initial field before sampling begins:
+At generation time:
 
 ```python
 field += randn(4096) * seed_strength
 ```
 
-This shifts the field's starting state, producing a different generative trajectory from the same prompt. `seed_strength` controls how far the trajectory diverges.
+This perturbs initial field conditions, producing different sampling trajectories from the same prompt. It does not guarantee structural divergence of the global attractor, only local perturbation of the field state.
 
 ---
 
 ## Training Results
 
-**Hardware:** RTX 5060 Ti (16GB VRAM)  
+**Hardware:** RTX 5060 Ti (16GB VRAM)
 **Batch size:** 1 (full files, no padding, no windowing)
 
-### Run 1 — Bach corpus (201 files, 100 epochs, 8 min 11 sec) 23.55M parameters
+---
 
-| Epoch | Avg. Loss |
-|---|---|
-| 1 | 87.67 |
-| 2 | 8.64 |
-| 5 | 7.38 |
-| 10 | 7.10 |
-| 25 | 6.32 |
-| 50 | 5.00 |
-| 75 | 4.16 |
-| **100** | **3.93** |
+### Run 1 — Bach corpus (201 files, 100 epochs, 8 min 11 sec) — 23.55M parameters
 
-Vocab: 5,299 tokens. Random baseline: log(5299) ≈ 8.57. Below baseline by epoch 2.  
-Total tokens: 38.35M. Throughput: ~78k tok/sec.
+| Epoch   | Avg. Loss |
+| ------- | --------- |
+| 1       | 87.67     |
+| 2       | 8.64      |
+| 5       | 7.38      |
+| 10      | 7.10      |
+| 25      | 6.32      |
+| 50      | 5.00      |
+| 75      | 4.16      |
+| **100** | **3.93**  |
+
+Vocab: 5,299 tokens. Random baseline: log(5299) ≈ 8.57 → model drops below baseline by epoch 2.
+
+Total tokens: 38.35M
+Throughput: ~78k tok/sec
+
+---
+
+### Observed failure mode (critical)
+
+Despite convergence, the model exhibits a **collapsed generative manifold**:
+
+* Outputs converge to a single dominant musical attractor (“default amalgam song”)
+* This attractor persists across:
+
+  * different seeds
+  * different temperatures
+  * different checkpoints
+  * different runs
+
+This is not sampling noise. It is **representation collapse in generation space**.
+
+The model is not learning a distribution over compositions. It is learning a single stable solution with minor stochastic perturbations.
+
+---
 
 ### Earlier runs (archived)
 
-Prior to the current preprocessing pipeline, FM was trained on the same Bach corpus with an earlier vocab design (532 tokens, no REST tokens, no beat_bin). Those runs reached loss 1.88 over 400 epochs in 15 minutes. Results are not directly comparable due to vocab changes.
+Prior to current preprocessing pipeline, FM trained on the same Bach corpus using:
+
+* 532-token vocabulary
+* no REST tokens
+* no beat_bin
+
+Those runs reached loss **1.88 over 400 epochs in 15 minutes**.
+
+These results are not directly comparable due to:
+
+* vocabulary expansion
+* structural token changes
+* inclusion of REST operator and temporal encoding changes
 
 ---
 
@@ -129,7 +183,9 @@ Prior to the current preprocessing pipeline, FM was trained on the same Bach cor
 pip install torch rich
 ```
 
-No other dependencies. The MIDI parser is pure Python stdlib.
+No external dependencies. MIDI parsing is stdlib-only.
+
+---
 
 ### Train
 
@@ -137,29 +193,42 @@ No other dependencies. The MIDI parser is pure Python stdlib.
 python train/train.py --midi_dir /path/to/midi --out_dir checkpoints
 ```
 
-On first run, tokenizes the corpus and packs it to flat binary files (`tokens.bin`, `dna.bin`, `offsets.bin`). Subsequent runs load instantly from cache. Use `--retokenize` to rebuild.
+First run builds binary dataset cache:
 
-Full options:
+* `tokens.bin`
+* `dna.bin`
+* `offsets.bin`
+
+Subsequent runs load cached tensors.
+
+Use `--retokenize` to rebuild.
+
+---
+
+### Full options
+
 ```
---midi_dir        Directory of MIDI files (searched recursively)
---out_dir         Output directory for checkpoints and logs
+--midi_dir        Directory of MIDI files (recursive scan)
+--out_dir         Output directory for checkpoints/logs
 --epochs          Number of epochs (default: 100)
 --batch_size      Sequences per batch (default: 1 — full files, no padding)
 --dim             Field dimension (default: 4096)
---decoder_layers  Decoder hidden layers (default: 3)
---decoder_hidden  Decoder hidden dim (default: 2048)
+--decoder_layers  Decoder depth (default: 3)
+--decoder_hidden  Decoder width (default: 2048)
 --dropout         Dropout rate (default: 0.1)
 --lr              Learning rate (default: 3e-4)
 --weight_decay    Weight decay (default: 0.01)
 --grad_clip       Gradient clipping (default: 1.0)
 --warmup_steps    LR warmup steps (default: 200)
---min_seq_len     Minimum sequence length to include (default: 8)
---save_steps      Checkpoint every N steps (default: 500)
---save_minutes    Timed checkpoint every N minutes (default: 30)
---print_steps     Print stats every N steps (default: 10)
---retokenize      Force rebuild tokenizer and binary cache
---fresh           Ignore existing checkpoint, start clean
+--min_seq_len     Minimum sequence length (default: 8)
+--save_steps      Checkpoint interval (default: 500)
+--save_minutes    Time-based checkpoint interval (default: 30)
+--print_steps     Logging interval (default: 10)
+--retokenize      Rebuild tokenizer and dataset cache
+--fresh           Ignore existing checkpoints
 ```
+
+---
 
 ### Generate
 
@@ -168,20 +237,26 @@ python generate/generate.py --checkpoint checkpoints/best.pt --output out.mid
 ```
 
 With MIDI prompt:
+
 ```bash
 python generate/generate.py --checkpoint checkpoints/best.pt \
     --prompt_midi seed.mid --tokens 512 --temperature 0.85
 ```
 
-Generation options:
+---
+
+### Generation options
+
 ```
 --tokens          Number of tokens to generate (default: 512)
 --temperature     Sampling temperature (default: 0.85)
 --top_k           Top-k filtering (default: 50)
 --top_p           Nucleus sampling threshold (default: 0.95)
---seed_strength   Field seed magnitude — 0=off, 0.05–0.15 recommended (default: 0.05)
---seed            Integer seed for reproducibility (default: random each run)
+--seed_strength   Field perturbation scale (default: 0.05, recommended 0.05–0.15)
+--seed            RNG seed (default: random per run)
 ```
+
+---
 
 ### Benchmark
 
@@ -195,44 +270,44 @@ python benchmark/benchmark.py
 
 ```
 checkpoints/
-  tokenizer.pkl     — vocabulary and DNA field maps
-  tokens.bin        — flat int32 array of all token indices
-  dna.bin           — flat float32 array of all DNA fields (total_tokens × 7)
-  offsets.bin       — int64 array of (start, length) per sequence
-  manifest.json     — corpus metadata
-  config.json       — model configuration
-  latest.pt         — most recent checkpoint (resume target)
-  best.pt           — lowest loss checkpoint
-  training_log.csv  — full per-step statistics
-  run_stats.json    — final run summary
+  tokenizer.pkl     — vocabulary + DNA field maps
+  tokens.bin        — flattened token indices
+  dna.bin           — flattened DNA vectors (N × 7)
+  offsets.bin       — sequence boundaries
+  manifest.json     — dataset metadata
+  config.json       — model config
+  latest.pt         — latest checkpoint
+  best.pt           — best validation loss checkpoint
+  training_log.csv  — full training history
+  run_stats.json    — summary statistics
 ```
 
 ---
 
 ## Comparison
 
-| Property | Transformer | RNN/LSTM | Mamba/SSM | **FM** |
-|---|---|---|---|---|
-| Training parallelism | Full | None | Partial | **Full** |
-| Serial dependency | None | Yes | Partial | **None** |
-| Inference memory | O(n) KV cache | O(1) | O(1) | **O(1)** |
-| Custom CUDA needed | No | No | Yes | **No** |
-| Token representation | Flat embedding | Flat embedding | Flat embedding | **Structured DNA** |
-| Position encoding | Added | Implicit | Implicit | **Multiplied (fused)** |
-| Sequence length limit | Quadratic cost | Unlimited | Unlimited | **Unlimited** |
-| VRAM at inference | Grows with context | Fixed | Fixed | **Fixed (one vector)** |
+| Property              | Transformer    | RNN/LSTM       | Mamba/SSM      | FM                    |
+| --------------------- | -------------- | -------------- | -------------- | --------------------- |
+| Training parallelism  | Full           | None           | Partial        | Full                  |
+| Serial dependency     | None           | Yes            | Partial        | None                  |
+| Inference memory      | O(n) KV cache  | O(1)           | O(1)           | O(1)                  |
+| Custom CUDA needed    | No             | No             | Yes            | No                    |
+| Token representation  | Flat embedding | Flat embedding | Flat embedding | Structured DNA        |
+| Position encoding     | Added          | Implicit       | Implicit       | Multiplied (fused)    |
+| Sequence length limit | Quadratic cost | Unlimited      | Unlimited      | Unlimited             |
+| VRAM at inference     | Grows          | Fixed          | Fixed          | Fixed (single vector) |
 
 ---
 
 ## What This Is Not
 
-FM is not a transformer with a different attention mechanism. It has no attention.
+FM is not a transformer with modified attention. There is no attention mechanism.
 
-FM is not an RNN. There is no recurrent weight matrix. There is no hidden state that feeds back into itself. There is no serial dependency between timesteps during training.
+FM is not an RNN. There is no recurrent state matrix and no learned temporal feedback loop.
 
-FM is not an SSM. It requires no custom CUDA kernels, no parallel scan implementation, no structured state matrices.
+FM is not an SSM. There are no structured state transitions, no scan kernels, no custom CUDA recurrence.
 
-FM is a new primitive: a sequence of position-aware geometric contributions accumulating into a shared field, decoded locally at every position.
+FM is a geometric accumulation system: a sequence of position-weighted token contributions forming a shared field, decoded locally.
 
 ---
 
