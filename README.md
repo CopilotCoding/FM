@@ -2,8 +2,6 @@
 
 A new sequence architecture invented May 26, 2026. Not a transformer. Not an RNN. Not an SSM.
 
-Trained on 201 Bach MIDI files. Loss 3.09 in 4:43 on a single consumer GPU.
-
 ---
 
 ## Core Idea
@@ -89,60 +87,34 @@ At generation time, a random vector is added to the initial field before samplin
 field += randn(4096) * seed_strength
 ```
 
-This shifts the field's starting state, producing a different generative trajectory from the same prompt. The model was not trained with seeds — it treats the shifted field as a slightly different positional context. `seed_strength` controls how far the trajectory diverges.
+This shifts the field's starting state, producing a different generative trajectory from the same prompt. `seed_strength` controls how far the trajectory diverges.
 
 ---
 
 ## Training Results
 
 **Hardware:** RTX 5060 Ti (16GB VRAM)  
-**Dataset:** 201 Bach MIDI files, sequences 120–24,203 notes  
-**Vocab:** 5,294 tokens (note × pitch × duration × beat_bin + REST × duration × beat_bin)  
-**VRAM:** up to 1.21GB allocated  
 **Batch size:** 1 (full files, no padding, no windowing)
 
-### Run 1 — original vocab (pitch × duration, 532 tokens, 100 epochs) 13.78M parameters
-
-| Epoch | Avg. Loss | Note |
-|---|---|---|
-| 1 | 62.45 | First pass (LR warmup) |
-| 2 | 5.48 | Below random baseline (log(532) ≈ 6.28) |
-| 5 | 5.05 | |
-| 10 | 4.87 | |
-| 25 | 4.50 | |
-| 50 | 3.82 | |
-| 75 | 3.27 | |
-| **100** | **3.09** | **4 min 43 sec total** |
-
-### Run 2 — REST tokens + beat_bin vocab (400 epochs, 15 min 21 sec) 23.54M parameters
-
-Vocab key changed to `(event_type, pitch, snapped_duration, beat_bin)`. REST tokens added. Beat position included in vocab identity at 16-bin resolution. Vocab expanded to 5,294 tokens, parameters to 23.54M.
+### Run 1 — Bach corpus (201 files, 100 epochs, 8 min 11 sec) 23.55M parameters
 
 | Epoch | Avg. Loss |
 |---|---|
-| 1 | 71.34 |
-| 2 | 8.62 |
-| 5 | 7.33 |
-| 10 | 6.99 |
-| 25 | 6.29 |
-| 50 | 5.10 |
-| 75 | 4.14 |
-| 100 | 3.49 |
-| 125 | 3.04 |
-| 150 | 2.81 |
-| 175 | 2.70 |
-| 200 | 2.63 |
-| 225 | 2.53 |
-| 250 | 2.32 |
-| 275 | 2.17 |
-| 300 | 2.06 |
-| 325 | 2.00 |
-| 350 | 1.95 |
-| 375 | 1.92 |
-| **400** | **1.88** | **best: 1.876 at epoch 398** |
+| 1 | 87.67 |
+| 2 | 8.64 |
+| 5 | 7.38 |
+| 10 | 7.10 |
+| 25 | 6.32 |
+| 50 | 5.00 |
+| 75 | 4.16 |
+| **100** | **3.93** |
 
-**Total tokens processed:** 74.74M  
-**Throughput:** ~53 it/s, up to 1.7M tok/s depending on file length
+Vocab: 5,299 tokens. Random baseline: log(5299) ≈ 8.57. Below baseline by epoch 2.  
+Total tokens: 38.35M. Throughput: ~78k tok/sec.
+
+### Earlier runs (archived)
+
+Prior to the current preprocessing pipeline, FM was trained on the same Bach corpus with an earlier vocab design (532 tokens, no REST tokens, no beat_bin). Those runs reached loss 1.88 over 400 epochs in 15 minutes. Results are not directly comparable due to vocab changes.
 
 ---
 
@@ -162,6 +134,8 @@ No other dependencies. The MIDI parser is pure Python stdlib.
 python train/train.py --midi_dir /path/to/midi --out_dir checkpoints
 ```
 
+On first run, tokenizes the corpus and packs it to flat binary files (`tokens.bin`, `dna.bin`, `offsets.bin`). Subsequent runs load instantly from cache. Use `--retokenize` to rebuild.
+
 Full options:
 ```
 --midi_dir        Directory of MIDI files (searched recursively)
@@ -180,11 +154,9 @@ Full options:
 --save_steps      Checkpoint every N steps (default: 500)
 --save_minutes    Timed checkpoint every N minutes (default: 30)
 --print_steps     Print stats every N steps (default: 10)
---retokenize      Force rebuild tokenizer and sequence cache
+--retokenize      Force rebuild tokenizer and binary cache
 --fresh           Ignore existing checkpoint, start clean
 ```
-
-Tokenizer and tokenized sequences are cached to disk on first run. Subsequent runs load from cache instantly. Use `--retokenize` to rebuild if the dataset changes.
 
 ### Generate
 
@@ -208,15 +180,11 @@ Generation options:
 --seed            Integer seed for reproducibility (default: random each run)
 ```
 
-Same checkpoint, different `--seed`, different output.
-
 ### Benchmark
 
 ```bash
 python benchmark/benchmark.py
 ```
-
-The benchmark measures training throughput, inference throughput, and sequence length scaling. FM should show linear scaling — the benchmark table will confirm this.
 
 ---
 
@@ -224,15 +192,16 @@ The benchmark measures training throughput, inference throughput, and sequence l
 
 ```
 checkpoints/
-  tokenizer.pkl          — vocabulary and DNA field maps
-  sequences_cache.pkl    — pre-tokenized corpus (rebuilt with --retokenize)
-  config.json            — model configuration
-  latest.pt              — most recent checkpoint (resume target)
-  best.pt                — lowest loss checkpoint
-  epoch_001_loss62.pt    — per-epoch snapshots
-  timed_20260526_*.pt    — timed checkpoints (every N minutes)
-  training_log.csv       — full per-step statistics
-  run_stats.json         — final run summary
+  tokenizer.pkl     — vocabulary and DNA field maps
+  tokens.bin        — flat int32 array of all token indices
+  dna.bin           — flat float32 array of all DNA fields (total_tokens × 7)
+  offsets.bin       — int64 array of (start, length) per sequence
+  manifest.json     — corpus metadata
+  config.json       — model configuration
+  latest.pt         — most recent checkpoint (resume target)
+  best.pt           — lowest loss checkpoint
+  training_log.csv  — full per-step statistics
+  run_stats.json    — final run summary
 ```
 
 ---
