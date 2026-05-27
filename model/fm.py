@@ -110,21 +110,19 @@ class FM(nn.Module):
             nn.LayerNorm(dim),
         )
 
-        # Field → logits decoder (per-layer seed gating)
-        # Each decoder layer has its own seed projection for independent gating
-        self.dec_linears = nn.ModuleList()
-        self.dec_seed_projs = nn.ModuleList()
+        # Field → logits decoder (standard MLP, no per-layer seed gating)
+        # Seed conditioning happens at field level only — cleaner signal
+        dec_layers = []
         in_dim = dim
         for i in range(n_decoder_layers):
             is_last = (i == n_decoder_layers - 1)
             out_dim = vocab_size if is_last else decoder_hidden
-            self.dec_linears.append(nn.Linear(in_dim, out_dim))
-            # Per-layer seed projects to same dim as layer output
-            self.dec_seed_projs.append(nn.Linear(seed_dim, out_dim))
+            dec_layers.append(nn.Linear(in_dim, out_dim))
+            if not is_last:
+                dec_layers.append(nn.GELU())
+                dec_layers.append(nn.Dropout(dropout))
             in_dim = decoder_hidden
-
-        self.dec_gelu    = nn.GELU()
-        self.dec_dropout = nn.Dropout(dropout)
+        self.decoder = nn.Sequential(*dec_layers)
         self.dropout     = nn.Dropout(dropout)
 
         # Field-level seed gain — gates field accumulation per dimension
@@ -157,29 +155,9 @@ class FM(nn.Module):
         """Compute field-level gain mask from seed. (B, dim) ∈ (0,1)"""
         return torch.sigmoid(self.seed_proj(seed.to(dtype)) * SEED_SIGMOID_SCALE)
 
-    def _decode_with_seed(self, field_flat, seed_flat, dtype):
-        """
-        Decoder with per-layer seed gating.
-        field_flat: (N, dim)
-        seed_flat:  (N, seed_dim)
-        Returns: (N, vocab_size)
-        """
-        x = field_flat
-        for i, linear in enumerate(self.dec_linears):
-            is_last = (i == self.n_decoder_layers - 1)
-            h = linear(x)
-            # Per-layer seed gate: sigmoid(seed_proj(seed)) multiplied into layer output
-            layer_gain = torch.sigmoid(
-                self.dec_seed_projs[i](seed_flat.to(dtype)) * SEED_SIGMOID_SCALE
-            )
-            h = h * layer_gain
-            if not is_last:
-                h = self.dec_gelu(h)
-                h = self.dec_dropout(h)
-                x = h
-            else:
-                x = h
-        return x
+    def _decode(self, field_flat):
+        """Standard decoder — no per-layer seed gating."""
+        return self.decoder(field_flat)
 
     # ── Training forward ───────────────────────────────────────────────────────
 
@@ -221,18 +199,11 @@ class FM(nn.Module):
         # Cumulative field
         field = torch.cumsum(modulated, dim=1)            # (B, T, dim)
 
-        # Per-layer seed decoder
-        field_flat = field.reshape(B * T, self.dim)
-        if seed is not None:
-            seed_flat = seed.to(dtype).unsqueeze(1).expand(-1, T, -1).reshape(B * T, self.seed_dim)
-        else:
-            seed_flat = torch.zeros(B * T, self.seed_dim, device=device, dtype=dtype)
-
-        logits = self._decode_with_seed(field_flat, seed_flat, dtype).reshape(B, T, self.vocab_size)
+        # Decode
+        logits = self._decode(field.reshape(B * T, self.dim)).reshape(B, T, self.vocab_size)
 
         if return_field:
-            # Return final field state (last position) for contrastive loss
-            field_final = field[:, -1, :]                 # (B, dim)
+            field_final = field[:, -1, :]
             return logits, field_final
 
         return logits
@@ -290,7 +261,6 @@ class FM(nn.Module):
             sv  = alpha * sv + (1.0 - alpha) * sv2
 
         gain       = self._seed_gain(sv, dtype).squeeze(0)        # (dim,)
-        seed_flat1 = sv.to(dtype)                                  # (1, seed_dim)
 
         # Build initial field
         dna       = self.dna(pc, oc, dur, bs, bc, vel, voi)
@@ -302,9 +272,7 @@ class FM(nn.Module):
         t = T_prompt
 
         for _ in range(max_new_tokens):
-            logits = self._decode_with_seed(
-                field.unsqueeze(0), seed_flat1, dtype
-            ).squeeze(0) / max(temperature, 1e-8)
+            logits = self._decode(field.unsqueeze(0)).squeeze(0) / max(temperature, 1e-8)
 
             if top_k > 0:
                 kk = min(top_k, logits.shape[-1])
