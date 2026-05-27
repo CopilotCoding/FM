@@ -87,12 +87,11 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 
 **Hardware:** RTX 5060 Ti (16GB VRAM)  
 **Dataset:** 201 Bach MIDI files, sequences 120–24,203 notes  
-**Parameters:** 23.54M  
 **Vocab:** 5,294 tokens (note × pitch × duration × beat_bin + REST × duration × beat_bin)  
 **VRAM:** up to 1.21GB allocated  
 **Batch size:** 1 (full files, no padding, no windowing)
 
-### Run 1 — original vocab (pitch × duration, 532 tokens, 100 epochs)
+### Run 1 — original vocab (pitch × duration, 532 tokens, 100 epochs) 13.78M parameters
 
 | Epoch | Avg. Loss | Note |
 |---|---|---|
@@ -105,7 +104,7 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 | 75 | 3.27 | |
 | **100** | **3.09** | **4 min 43 sec total** |
 
-### Run 2 — REST tokens + beat_bin vocab (400 epochs, 15 min 21 sec)
+### Run 2 — REST tokens + beat_bin vocab (400 epochs, 15 min 21 sec) 23.54M parameters
 
 Vocab key changed to `(event_type, pitch, snapped_duration, beat_bin)`. REST tokens added. Beat position included in vocab identity at 16-bin resolution. Vocab expanded to 5,294 tokens, parameters to 23.54M.
 
