@@ -45,7 +45,7 @@ The Field Machine is motivated by a different question: \textit{what if sequence
 
 A sequence is an ordered list. Order is a label — a position index — not a physical dependency between elements. Token 5 does not causally require token 4 to have been processed; it simply occupies position 5. If position is encoded directly into each token's representation, the entire sequence can be processed simultaneously, without any element waiting for any other.
 
-This observation leads to a three-part architecture: (1) encode each token as a geometrically structured vector that captures both its identity and its position, (2) accumulate all such vectors into a shared field via addition, and (3) decode predictions from the field state at each position. We show that this design is fully parallelizable during training, $O(1)$ at inference, requires no custom operations beyond standard \texttt{cumsum}, and achieves rapid convergence on a structured musical domain.
+This observation leads to a three-part architecture: (1) encode each token as a geometrically structured vector that captures both its identity and its position, (2) accumulate all such vectors into a shared field via addition, and (3) decode predictions from the field state at each position. We show that this design is fully parallelizable during training, $O(1)$ at inference, requires no custom operations beyond standard \texttt{cumsum}, and achieves decreasing cross-entropy loss on a structured musical domain.
 
 \section{Background and Related Work}
 
@@ -61,7 +61,7 @@ Standard sinusoidal position encodings \cite{vaswani2017attention} are \textit{a
 
 \subsection{Structured Token Representations}
 
-Standard sequence models use flat embedding tables: each token index maps to an arbitrary learned vector with no geometric structure. For domains with rich internal structure — music, chemistry, structured text — this requires the model to rediscover domain geometry from co-occurrence statistics. Work on knowledge-informed embeddings \cite{hamilton2017embedding} and physics-informed neural networks \cite{raissi2019physics} demonstrates that encoding domain structure directly into representations improves sample efficiency. FM applies this principle to the token level, constructing token vectors whose geometry matches the geometry of the musical domain before training begins.
+Standard sequence models use flat embedding tables: each token index maps to an arbitrary learned vector with no geometric structure. For domains with rich internal structure — music, chemistry, structured text — this requires the model to rediscover domain geometry from co-occurrence statistics. Work on knowledge-informed embeddings \cite{hamilton2017embedding} and physics-informed neural networks \cite{raissi2019physics} demonstrates that encoding domain structure directly into representations can benefit learning. FM applies this principle to the token level, constructing token vectors whose geometry matches the geometry of the musical domain before training begins.
 
 \section{The Field Machine}
 
@@ -203,13 +203,11 @@ Epoch & Avg.\ Loss & Note \\
 
 \textbf{Throughput}: approximately 74 iterations/second, 100k--900k tokens/second depending on file length. Peak allocated VRAM 0.64GB (7.5GB reserved by PyTorch allocator). Total training time for 100 epochs: \textbf{4 minutes 43 seconds}.
 
-\textbf{Convergence rate}: for reference, a 32M parameter Geometric State Machine (GSM) architecture \cite{gsm2026} trained on the same corpus required 45 minutes for 100 epochs to reach a final loss of 0.12. FM reaches meaningful convergence in a fraction of that time with 2.3x fewer parameters, due to the absence of any serial processing bottleneck.
+\textbf{Convergence rate}: for reference, a 32M parameter Geometric State Machine (GSM) architecture \cite{gsm2026} trained on the same corpus required 45 minutes for 100 epochs to reach a final loss of 0.12. FM reaches a final loss of 3.09 in one ninth the time with 2.3x fewer parameters.
 
 \subsection{Discussion}
 
-The sharp loss drop between epoch 1 (62.45) and epoch 2 (5.48) represents the model learning the basic grammar of the musical vocabulary — which note types follow which — from a single pass through the corpus. The random baseline for 532 tokens is $\log(532) \approx 6.28$; crossing below this threshold indicates genuine learning of statistical structure beyond uniform prediction.
-
-The high loss in epoch 1 reflects the warmup phase: the learning rate increases linearly from 0 to $3 \times 10^{-4}$ over the first 200 steps, during which the model's parameters are being oriented from random initialization. The gradient norms in epoch 1 are correspondingly large (average 1015), stabilizing to ~40 by epoch 2 and continuing to decrease.
+The sharp loss drop between epoch 1 (62.45) and epoch 2 (5.48) corresponds to the model crossing below the random baseline of $\log(532) \approx 6.28$ — the loss achievable by a uniform predictor. Crossing below this threshold indicates the model is capturing statistical structure in the corpus beyond uniform prediction. The high loss in epoch 1 reflects the warmup phase: the learning rate increases linearly from 0 to $3 \times 10^{-4}$ over the first 200 steps. The gradient norms in epoch 1 are correspondingly large (average 1015), stabilizing to ~40 by epoch 2 and continuing to decrease.
 
 The variability in tokens/second (100k--900k) reflects the variable sequence lengths in the corpus: short files (120 tokens) complete very quickly while long files (24,203 tokens) take proportionally longer. At batch size 1, this is expected and correct behavior — each file contributes gradient signal proportional to its length.
 
@@ -280,7 +278,7 @@ FM matches Mamba's asymptotic complexity without requiring custom CUDA kernels, 
 We have presented the Field Machine, a sequence architecture that achieves full training parallelism and $O(1)$ inference without recurrence, attention, or custom hardware operations. The key contributions are:
 
 \begin{enumerate}
-    \item \textbf{Structured token DNA}: domain geometry encoded directly into token representations before training, improving sample efficiency and eliminating the need to learn geometric relationships from co-occurrence statistics.
+    \item \textbf{Structured token DNA}: domain geometry encoded directly into token representations before training, eliminating the need to learn geometric relationships from co-occurrence statistics.
 
     \item \textbf{Multiplicative position fusion}: position and identity fused into a single inseparable object, enabling the summation to preserve ordering information.
 
@@ -289,7 +287,7 @@ We have presented the Field Machine, a sequence architecture that achieves full 
     \item \textbf{$O(1)$ inference}: state is a single fixed-size vector, updated by one addition per token, independent of sequence length.
 \end{enumerate}
 
-These four primitives together constitute a new sequence modeling paradigm. The architecture was validated on symbolic music generation, achieving rapid convergence below the random baseline within two epochs on a consumer GPU, with a 5-minute full training run.
+These four primitives together constitute a new sequence modeling paradigm. The architecture was validated on symbolic music generation, reaching loss 3.09 in 4 minutes 43 seconds on a consumer GPU, crossing below the random baseline within two epochs.
 
 The core insight is that a sequence is not inherently a chain. It is an ordered set. Order is a label. When that label is encoded directly into each element's representation, the chain dissolves — and with it, the serial bottleneck that has constrained sequence modeling since its inception.
 

@@ -2,13 +2,13 @@
 
 A new sequence architecture invented May 26, 2026. Not a transformer. Not an RNN. Not an SSM.
 
-Trained on 201 Bach MIDI files. Reaches meaningful musical structure in under 5 minutes on a single consumer GPU. 100 epochs in the time a transformer needs for 3.
+Trained on 201 Bach MIDI files. Loss 3.09 in 4:43 on a single consumer GPU.
 
 ---
 
 ## Core Idea
 
-Every token is a geometrically structured object — its musical dimensions encoded with geometry that matches the concept. These objects write into a high-dimensional field via cumulative sum. The field is decoded at every position.
+Every token is a geometrically structured object — its dimensions encoded with geometry that matches the domain's structure. These objects write into a high-dimensional field via cumulative sum. The field is decoded at every position.
 
 **No loops. No approximation. No serial dependency during training. O(1) inference.**
 
@@ -24,7 +24,7 @@ note_DNA(23) → Linear(23, 4096) → × pos_encoding(i, base=32768) → cumsum 
 
 ### Token DNA (23 dimensions)
 
-Every note is a real musical object with geometry that matches its musical meaning — not a flat index into an arbitrary lookup table.
+Every note is a structured geometric vector — not a flat index into an arbitrary lookup table.
 
 | Field | Encoding | Dims | Geometry |
 |---|---|---|---|
@@ -41,7 +41,7 @@ The geometry is real before training begins. The model does not need to discover
 
 Vocab key: `(pitch, snapped_duration)` — 529 tokens covering the full Bach corpus.
 
-Pitch, duration, beat position, velocity, and voice are **not** combined into a combinatorial vocabulary. Velocity and beat position are continuous expression — they live in the DNA fields, not the token identity. This reduces the vocabulary from ~18,000 arbitrary symbols to 529 musically meaningful types.
+Pitch, duration, beat position, velocity, and voice are **not** combined into a combinatorial vocabulary. Velocity and beat position are continuous expression — they live in the DNA fields, not the token identity. This reduces the vocabulary from ~18,000 possible combinations to 529 pitch×duration types.
 
 ### Position Encoding
 
@@ -88,7 +88,7 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 
 | Epoch | Avg. Loss | Note |
 |---|---|---|
-| 1 | 62.45 | First pass, learning vocabulary (LR warmup) |
+| 1 | 62.45 | First pass (LR warmup) |
 | 2 | 5.48 | Below random baseline (log(532) ≈ 6.28) |
 | 5 | 5.05 | Stable descent |
 | 10 | 4.87 | |
@@ -101,7 +101,7 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 
 **Total training time for 100 epochs: 4 minutes 43 seconds.**
 
-For comparison: the GSM architecture trained on the same corpus required 45 minutes for 100 epochs with 32M parameters. FM achieves faster convergence with 13.78M parameters in one ninth the time.
+For comparison: the GSM architecture trained on the same corpus required 45 minutes for 100 epochs with 32M parameters. FM trains in one ninth the time with 13.78M parameters.
 
 **Throughput:** ~74 it/s, 100k–900k tok/s depending on file length, 0.64GB allocated VRAM.
 
@@ -218,4 +218,4 @@ FM is a new primitive: a sequence of position-aware geometric contributions accu
 
 ---
 
-*Invented May 26, 2026. Trained on Bach. Works.*
+*Invented May 26, 2026. Trained on Bach.*
