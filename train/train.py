@@ -444,10 +444,13 @@ def train(args):
                     if len(field_buffer) > 8:
                         field_buffer.pop(0)
 
-                    loss = (loss_task
-                            + 0.15 * loss_gain_div
-                            + 0.10 * loss_contrastive
-                            + 0.05 * loss_consistency)
+                    loss = loss_task
+                    # Diversity/contrastive losses disabled — were too aggressive,
+                    # destroyed musical repetition structure.
+                    # Seed variation comes from clustering + multiplicative gain alone.
+                    # + 0.15 * loss_gain_div
+                    # + 0.10 * loss_contrastive
+                    # + 0.05 * loss_consistency
 
                 optimizer.zero_grad()
                 if use_scaler:
