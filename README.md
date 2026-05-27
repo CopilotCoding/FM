@@ -1,4 +1,4 @@
-WIP doesn't scale to large datasets yet, working on it.
+WIP tokenizer doesn't scale to large datasets yet, working on it.
 
 # FM — Field Machine
 
