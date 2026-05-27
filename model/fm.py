@@ -334,8 +334,10 @@ class FM(nn.Module):
             # Top-p (nucleus)
             if top_p < 1.0:
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                cum_probs  = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                remove_mask = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+                cum_probs   = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                remove_mask = cum_probs > top_p
+                remove_mask[..., 1:] = remove_mask[..., :-1].clone()
+                remove_mask[..., 0]  = False
                 sorted_logits[remove_mask] = float('-inf')
                 logits = torch.zeros_like(logits).scatter_(1, sorted_idx, sorted_logits)
 
