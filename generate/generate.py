@@ -173,7 +173,7 @@ def generate(args):
         prompt[k] = t
 
     print(f"\nGenerating {args.tokens} tokens...")
-    print(f"  Temperature: {args.temperature} | top_k: {args.top_k} | top_p: {args.top_p}")
+    print(f"  Temperature: {args.temperature} | top_k: {args.top_k} | top_p: {args.top_p} | seed_strength: {args.seed_strength} | seed: {args.seed}")
 
     with torch.amp.autocast('cuda', dtype=dtype, enabled=(device.type=='cuda')):
         generated = model.generate(
@@ -182,6 +182,8 @@ def generate(args):
             temperature    = args.temperature,
             top_k          = args.top_k,
             top_p          = args.top_p,
+            seed_strength  = args.seed_strength,
+            seed           = args.seed,
         )
 
     print(f"  Generated {len(generated)} tokens")
@@ -199,7 +201,9 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_midi',  default='',                 help='Seed MIDI file (optional)')
     parser.add_argument('--tokens',       type=int,   default=512,    help='Tokens to generate')
     parser.add_argument('--temperature',  type=float, default=0.85,   help='Sampling temperature')
-    parser.add_argument('--top_k',        type=int,   default=50)
-    parser.add_argument('--top_p',        type=float, default=0.95)
+    parser.add_argument('--top_k',          type=int,   default=50)
+    parser.add_argument('--top_p',          type=float, default=0.95)
+    parser.add_argument('--seed_strength',  type=float, default=0.05,  help='Field seed offset magnitude (0=off, 0.05–0.15 recommended)')
+    parser.add_argument('--seed',           type=int,   default=None,   help='Random seed for reproducibility (None=random each run)')
     args = parser.parse_args()
     generate(args)

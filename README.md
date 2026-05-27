@@ -1,5 +1,3 @@
-WIP tokenizer doesn't scale to large datasets yet, working on it. Also forgot to add randomization/seeding to the outputs, so it produced the exact same song every time lmao.
-
 # FM — Field Machine
 
 A new sequence architecture invented May 26, 2026. Not a transformer. Not an RNN. Not an SSM.
@@ -83,6 +81,16 @@ field_t = field_{t-1} + project(dna(token_t)) * pos_vec[t]
 
 State is one 4096-dimensional vector. Never grows. Constant memory forever. One vector addition per token. No KV cache. No attention over growing context.
 
+### Field Seed (generation-time variation)
+
+At generation time, a random vector is added to the initial field before sampling begins:
+
+```python
+field += randn(4096) * seed_strength
+```
+
+This shifts the field's starting state, producing a different generative trajectory from the same prompt. The model was not trained with seeds — it treats the shifted field as a slightly different positional context. `seed_strength` controls how far the trajectory diverges.
+
 ---
 
 ## Training Results
@@ -143,7 +151,7 @@ Vocab key changed to `(event_type, pitch, snapped_duration, beat_bin)`. REST tok
 ### Install
 
 ```bash
-pip install torch
+pip install torch rich
 ```
 
 No other dependencies. The MIDI parser is pure Python stdlib.
@@ -172,9 +180,11 @@ Full options:
 --save_steps      Checkpoint every N steps (default: 500)
 --save_minutes    Timed checkpoint every N minutes (default: 30)
 --print_steps     Print stats every N steps (default: 10)
---retokenize      Force rebuild tokenizer
+--retokenize      Force rebuild tokenizer and sequence cache
 --fresh           Ignore existing checkpoint, start clean
 ```
+
+Tokenizer and tokenized sequences are cached to disk on first run. Subsequent runs load from cache instantly. Use `--retokenize` to rebuild if the dataset changes.
 
 ### Generate
 
@@ -190,11 +200,15 @@ python generate/generate.py --checkpoint checkpoints/best.pt \
 
 Generation options:
 ```
---tokens        Number of tokens to generate (default: 512)
---temperature   Sampling temperature (default: 0.85)
---top_k         Top-k filtering (default: 50)
---top_p         Nucleus sampling threshold (default: 0.95)
+--tokens          Number of tokens to generate (default: 512)
+--temperature     Sampling temperature (default: 0.85)
+--top_k           Top-k filtering (default: 50)
+--top_p           Nucleus sampling threshold (default: 0.95)
+--seed_strength   Field seed magnitude — 0=off, 0.05–0.15 recommended (default: 0.05)
+--seed            Integer seed for reproducibility (default: random each run)
 ```
+
+Same checkpoint, different `--seed`, different output.
 
 ### Benchmark
 
@@ -211,6 +225,7 @@ The benchmark measures training throughput, inference throughput, and sequence l
 ```
 checkpoints/
   tokenizer.pkl          — vocabulary and DNA field maps
+  sequences_cache.pkl    — pre-tokenized corpus (rebuilt with --retokenize)
   config.json            — model configuration
   latest.pt              — most recent checkpoint (resume target)
   best.pt                — lowest loss checkpoint
