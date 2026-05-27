@@ -40,13 +40,10 @@ class FMDataset(Dataset):
 
         total = meta['total_tokens']
 
-        # Load everything into pinned RAM — one-time cost, instant access forever
-        tokens_raw  = np.fromfile(str(tokens_bin),  dtype=np.int32)
-        dna_raw     = np.fromfile(str(dna_bin),     dtype=np.float32).reshape(total, N_DNA)
+        # Use memmap — don't load entire dataset into RAM
         offsets_raw = np.fromfile(str(offsets_bin), dtype=np.int64).reshape(-1, 2)
-
-        self.tokens  = torch.from_numpy(tokens_raw.astype(np.int64))
-        self.dna     = torch.from_numpy(dna_raw)
+        self.tokens  = np.memmap(str(tokens_bin),  dtype=np.int32,   mode='r')
+        self.dna     = np.memmap(str(dna_bin),     dtype=np.float32, mode='r').reshape(total, N_DNA)
         self.offsets = [(int(offsets_raw[i, 0]), int(offsets_raw[i, 1]))
                         for i in range(len(offsets_raw))
                         if int(offsets_raw[i, 1]) >= min_len]
@@ -68,8 +65,8 @@ class FMDataset(Dataset):
 
     def _getitem_bin(self, idx):
         start, length = self.offsets[idx]
-        toks = self.tokens[start:start+length]   # (L,) int64
-        dna  = self.dna[start:start+length]       # (L, 7) float32
+        toks = torch.from_numpy(np.array(self.tokens[start:start+length], dtype=np.int64))
+        dna  = torch.from_numpy(np.array(self.dna[start:start+length],    dtype=np.float32))
 
         item = {}
         for i, field in enumerate(DNA_FIELDS):
