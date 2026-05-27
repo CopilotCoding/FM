@@ -134,6 +134,11 @@ class FM(nn.Module):
         self.idx_to_fields    = None
 
         self._init_weights()
+        # Reinitialize seed_proj with larger weights — ensures gain masks are far from
+        # uniform 0.5 even early in training. Without this, near-zero projection → sigmoid
+        # near 0.5 everywhere → seed has no effect.
+        nn.init.normal_(self.seed_proj.weight, std=0.5)
+        nn.init.zeros_(self.seed_proj.bias)
 
     def _init_weights(self):
         for m in self.modules():
