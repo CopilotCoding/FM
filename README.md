@@ -39,9 +39,14 @@ The geometry is real before training begins. The model does not need to discover
 
 ### Vocabulary
 
-Vocab key: `(pitch, snapped_duration)` — 529 tokens covering the full Bach corpus.
+Vocab key: `(event_type, pitch, snapped_duration, beat_bin)` — note tokens plus REST tokens.
 
-Pitch, duration, beat position, velocity, and voice are **not** combined into a combinatorial vocabulary. Velocity and beat position are continuous expression — they live in the DNA fields, not the token identity. This reduces the vocabulary from ~18,000 possible combinations to 529 pitch×duration types.
+- **NOTE** tokens carry full DNA geometry: pitch, octave, duration, beat position, velocity, voice
+- **REST** tokens carry only duration and beat position — pitch/octave/velocity/voice are zeroed. REST is not silence by absence; it is an explicit temporal operator with duration, contributing a pitch-free vector to the field.
+
+Beat position is quantized to 16 bins (16th-note resolution within a 4/4 bar) and included in the vocab key, so the model learns *when* events happen — not just *what* they are.
+
+Velocity remains a continuous DNA field, not a vocab dimension.
 
 ### Position Encoding
 
