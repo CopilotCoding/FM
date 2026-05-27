@@ -87,8 +87,9 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 
 **Hardware:** RTX 5060 Ti (16GB VRAM)  
 **Dataset:** 201 Bach MIDI files, sequences 120–24,203 notes  
-**Parameters:** 13.78M  
-**VRAM:** up to 1.12GB allocated (PyTorch reserves several GB)  
+**Parameters:** 23.54M  
+**Vocab:** 5,294 tokens (note × pitch × duration × beat_bin + REST × duration × beat_bin)  
+**VRAM:** up to 1.21GB allocated  
 **Batch size:** 1 (full files, no padding, no windowing)
 
 ### Run 1 — original vocab (pitch × duration, 532 tokens, 100 epochs)
@@ -104,24 +105,32 @@ State is one 4096-dimensional vector. Never grows. Constant memory forever. One 
 | 75 | 3.27 | |
 | **100** | **3.09** | **4 min 43 sec total** |
 
-### Run 2 — REST tokens + beat_bin vocab (200 epochs)
+### Run 2 — REST tokens + beat_bin vocab (400 epochs, 15 min 21 sec)
 
-Vocab key changed to `(event_type, pitch, snapped_duration, beat_bin)`. REST tokens added. Beat position included in vocab identity at 16-bin resolution.
+Vocab key changed to `(event_type, pitch, snapped_duration, beat_bin)`. REST tokens added. Beat position included in vocab identity at 16-bin resolution. Vocab expanded to 5,294 tokens, parameters to 23.54M.
 
-| Epoch | Avg. Loss | Note |
-|---|---|---|
-| 1 | 71.34 | First pass (LR warmup) |
-| 2 | 8.62 | |
-| 5 | 7.33 | |
-| 10 | 6.99 | |
-| 25 | 6.29 | Below random baseline (larger vocab) |
-| 50 | 5.10 | |
-| 75 | 4.14 | |
-| 100 | 3.49 | |
-| 125 | 3.04 | |
-| 150 | 2.81 | |
-| 175 | 2.70 | |
-| **200** | **2.63** | **15 min 6 sec total — best: 0.05 at epoch 165** |
+| Epoch | Avg. Loss |
+|---|---|
+| 1 | 71.34 |
+| 2 | 8.62 |
+| 5 | 7.33 |
+| 10 | 6.99 |
+| 25 | 6.29 |
+| 50 | 5.10 |
+| 75 | 4.14 |
+| 100 | 3.49 |
+| 125 | 3.04 |
+| 150 | 2.81 |
+| 175 | 2.70 |
+| 200 | 2.63 |
+| 225 | 2.53 |
+| 250 | 2.32 |
+| 275 | 2.17 |
+| 300 | 2.06 |
+| 325 | 2.00 |
+| 350 | 1.95 |
+| 375 | 1.92 |
+| **400** | **1.88** | **best: 1.876 at epoch 398** |
 
 **Total tokens processed:** 74.74M  
 **Throughput:** ~53 it/s, up to 1.7M tok/s depending on file length
